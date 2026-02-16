@@ -10,7 +10,7 @@
 -- After:     tree_client         (auto-farms, comms via adjacent modem)
 
 local CLIENT_TYPE = "tree_client"
-local PASTEBIN_ID = "ie0AiXdn"
+local UPDATE_URL = "https://raw.githubusercontent.com/OfficalMINI/cc_wraith_tree_client/refs/heads/main/tree_client.lua"
 
 -- Version hash from own file content
 local function compute_version()
@@ -395,9 +395,8 @@ end
 -- Fetches latest script from Pastebin, compares hash with local VERSION.
 -- If different, overwrites self and reboots. Needs internet via wired modem.
 local function check_pastebin_update()
-    local url = "https://pastebin.com/raw/" .. PASTEBIN_ID
-    print("[update] Checking pastebin...")
-    local ok, resp = pcall(http.get, url)
+    print("[update] Checking github...")
+    local ok, resp = pcall(http.get, UPDATE_URL)
     if not ok or not resp then
         print("[update] Fetch failed")
         return false
