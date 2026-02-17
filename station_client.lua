@@ -274,15 +274,28 @@ local function run_setup()
             if sw_desc == "" then sw_desc = "Switch " .. (#station_config.switches + 1) end
             write("Is this a parking bay switch? [y/N]: ")
             local is_parking = read()
-            table.insert(station_config.switches, {
+            local sw_entry = {
                 peripheral_name = sw_periph,
                 face = sw_face,
                 description = sw_desc,
                 state = false,
                 routes = {},
                 parking = (is_parking == "y" or is_parking == "Y"),
-            })
-            print("Added: " .. sw_desc .. " [" .. sw_periph .. ":" .. sw_face .. "]" .. (is_parking == "y" and " (PARKING)" or ""))
+            }
+            if sw_entry.parking then
+                print("")
+                print("-- Bay Detector Rail --")
+                sw_entry.bay_detector_periph = pick_integrator("BAY DETECTOR RAIL (input)")
+                sw_entry.bay_detector_face = pick_face("bay detector face", "top")
+                print("")
+                print("-- Bay Powered Rail --")
+                sw_entry.bay_rail_periph = pick_integrator("BAY POWERED RAIL (output)")
+                sw_entry.bay_rail_face = pick_face("bay powered rail face", "top")
+                sw_entry.bay_has_train = false
+            end
+            table.insert(station_config.switches, sw_entry)
+            local tag = sw_entry.parking and " (PARKING)" or ""
+            print("Added: " .. sw_desc .. " [" .. sw_periph .. ":" .. sw_face .. "]" .. tag)
             write("Add another switch? [y/N]: ")
             local more = read()
             if more ~= "y" and more ~= "Y" then break end
@@ -322,6 +335,25 @@ end
 
 local has_train = false   -- detected by detector rail integrator
 
+-- Per-bay state tracking for parking bays
+-- Keyed by switch index: {last_signal, last_toggle_time, has_train}
+local bay_states = {}
+
+local function init_bay_states()
+    for i, sw in ipairs(station_config.switches) do
+        if sw.parking and sw.bay_detector_periph then
+            if not bay_states[i] then
+                bay_states[i] = {
+                    last_signal = false,
+                    last_toggle_time = 0,
+                    has_train = sw.bay_has_train or false,
+                }
+            end
+        end
+    end
+end
+init_bay_states()
+
 local function brake_on()
     local ri = get_integrator(station_config.rail_periph)
     if ri then
@@ -344,8 +376,44 @@ local function dispatch()
     print("Dispatch complete, rail braked")
 end
 
--- Start with brake on
+-- Bay powered rail control
+local function bay_brake_on(sw_idx)
+    local sw = station_config.switches[sw_idx]
+    if not sw or not sw.bay_rail_periph then return end
+    local ri = get_integrator(sw.bay_rail_periph)
+    if ri then
+        pcall(ri.setOutput, sw.bay_rail_face, false)
+    end
+end
+
+local function dispatch_from_bay(sw_idx)
+    local sw = station_config.switches[sw_idx]
+    if not sw or not sw.bay_rail_periph then
+        print("ERROR: Bay " .. sw_idx .. " has no rail config")
+        return
+    end
+    local ri = get_integrator(sw.bay_rail_periph)
+    if not ri then
+        print("ERROR: Bay rail integrator not found: " .. tostring(sw.bay_rail_periph))
+        return
+    end
+    print(string.format("Bay %d dispatch: %s:%s -> ON", sw_idx, sw.bay_rail_periph, sw.bay_rail_face))
+    pcall(ri.setOutput, sw.bay_rail_face, true)
+    os.sleep(DISPATCH_PULSE)
+    pcall(ri.setOutput, sw.bay_rail_face, false)
+    if bay_states[sw_idx] then
+        bay_states[sw_idx].has_train = false
+    end
+    print("Bay " .. sw_idx .. " dispatch complete, rail braked")
+end
+
+-- Start with brake on (station + all bays)
 brake_on()
+for i, sw in ipairs(station_config.switches) do
+    if sw.parking and sw.bay_rail_periph then
+        bay_brake_on(i)
+    end
+end
 
 -- ========================================
 -- Detector Rail Monitoring (via integrator)
@@ -355,7 +423,6 @@ brake_on()
 -- when input changes: event, side, peripheral_name.
 -- Slow fallback poll for older AP versions.
 
-local detector_debug = false  -- verbose logging for every read
 local last_signal = false    -- previous detector reading (for edge detection)
 local last_toggle_time = 0   -- debounce: time of last toggle
 local DEBOUNCE_TIME = 2      -- ignore rising edges for N seconds after a toggle
@@ -380,21 +447,6 @@ local function check_detector()
         return false
     end
 
-    if detector_debug then
-        -- Show ALL faces to find where signal actually is
-        local parts = {}
-        for _, f in ipairs({"top","bottom","north","south","east","west"}) do
-            local fok, fval = pcall(ri.getInput, f)
-            local fok2, fana = pcall(ri.getAnalogInput, f)
-            if (fok and fval) or (fok2 and fana and fana > 0) then
-                table.insert(parts, f .. "=" .. tostring(fana) .. "***")
-            else
-                table.insert(parts, f .. "=" .. tostring(fana or 0))
-            end
-        end
-        print("[det] " .. table.concat(parts, " ") .. " train=" .. tostring(has_train))
-    end
-
     -- Toggle on rising edge with debounce
     local now = os.clock()
     if signal and not last_signal then
@@ -414,26 +466,43 @@ local function check_detector()
     return true
 end
 
--- Initial diagnostics
-print("[det] === DETECTOR DIAGNOSTICS ===")
-print("[det] Configured periph: " .. tostring(station_config.detector_periph))
-print("[det] Configured face:   " .. tostring(station_config.detector_face))
-print("[det] Integrators on network: " .. #redstone_integrators)
-for _, ri in ipairs(redstone_integrators) do
-    print("[det] --- " .. ri.name .. " ---")
-    for _, face in ipairs({"top","bottom","north","south","east","west"}) do
-        local ok1, dig = pcall(ri.periph.getInput, face)
-        local ok2, ana = pcall(ri.periph.getAnalogInput, face)
-        local tag = ""
-        if (ok1 and dig) or (ok2 and ana and ana > 0) then tag = " ***" end
-        print(string.format("[det]   %s: d=%s a=%s%s",
-            face,
-            ok1 and tostring(dig) or "ERR:"..tostring(dig),
-            ok2 and tostring(ana) or "ERR:"..tostring(ana),
-            tag))
+-- Per-bay detector check (same toggle+debounce logic)
+local function check_bay_detector(sw_idx)
+    local sw = station_config.switches[sw_idx]
+    if not sw or not sw.bay_detector_periph then return false end
+
+    local state = bay_states[sw_idx]
+    if not state then
+        bay_states[sw_idx] = {last_signal = false, last_toggle_time = 0, has_train = false}
+        state = bay_states[sw_idx]
     end
+
+    local ri = get_integrator(sw.bay_detector_periph)
+    if not ri then return false end
+
+    local ok, signal = pcall(ri.getInput, sw.bay_detector_face)
+    if not ok then return false end
+
+    local now = os.clock()
+    if signal and not state.last_signal then
+        if (now - state.last_toggle_time) >= DEBOUNCE_TIME then
+            state.has_train = not state.has_train
+            state.last_toggle_time = now
+            -- Persist bay state
+            sw.bay_has_train = state.has_train
+            save_config()
+            if state.has_train then
+                print("[bay " .. sw_idx .. "] >>> TRAIN PARKED <<<")
+            else
+                print("[bay " .. sw_idx .. "] >>> BAY EMPTY <<<")
+            end
+        end
+    end
+    state.last_signal = signal
+    return true
 end
-print("[det] ===========================")
+
+-- Initial detector check
 check_detector()
 
 -- ========================================
@@ -563,7 +632,7 @@ local function render_main_monitor()
         monitor.write("No route data")
     end
 
-    -- Switch status at bottom
+    -- Switch + bay status at bottom
     if #station_config.switches > 0 then
         local sy = mh - #station_config.switches
         if sy < btn_y + 1 then sy = btn_y + 1 end
@@ -573,9 +642,17 @@ local function render_main_monitor()
         for si, sw in ipairs(station_config.switches) do
             if sy + si <= mh then
                 monitor.setCursorPos(2, sy + si)
-                monitor.setTextColor(sw.state and colors.lime or colors.gray)
-                monitor.write(string.format("%d. %s [%s]",
-                    si, sw.description or sw.face, sw.state and "ON" or "OFF"))
+                if sw.parking then
+                    local bs = bay_states[si]
+                    local parked = bs and bs.has_train
+                    monitor.setTextColor(parked and colors.lime or colors.gray)
+                    monitor.write(string.format("%d. %s [%s]",
+                        si, sw.description or "Bay", parked and "PARKED" or "EMPTY"))
+                else
+                    monitor.setTextColor(sw.state and colors.lime or colors.gray)
+                    monitor.write(string.format("%d. %s [%s]",
+                        si, sw.description or sw.face, sw.state and "ON" or "OFF"))
+                end
             end
         end
     end
@@ -663,7 +740,12 @@ local function render_config_monitor()
     for si, sw in ipairs(station_config.switches) do
         if cy > mh - 3 then break end
         monitor.setCursorPos(2, cy)
-        local tag = sw.parking and " P" or ""
+        local tag = ""
+        if sw.parking then
+            local bs = bay_states[si]
+            local parked = bs and bs.has_train
+            tag = parked and " P*" or " P"
+        end
         monitor.setTextColor(sw.state and colors.lime or colors.yellow)
         monitor.write(string.format("%d.%s %s [%s]",
             si, tag, (sw.description or "Switch"):sub(1, mw - 14),
@@ -716,7 +798,14 @@ local function render_integrator_picker()
     mon_btn(1, 1, "back_to_config", {x1 = 1, x2 = 6})
 
     -- Title
-    local purpose_lbl = config_purpose == "rail" and "POWERED RAIL" or "DETECTOR RAIL"
+    local purpose_labels = {
+        rail = "POWERED RAIL",
+        detector = "DETECTOR RAIL",
+        switch = "SWITCH",
+        bay_detector = "BAY DETECTOR",
+        bay_rail = "BAY POWERED RAIL",
+    }
+    local purpose_lbl = purpose_labels[config_purpose] or config_purpose
     monitor.setCursorPos(1, 2)
     monitor.setTextColor(colors.cyan)
     monitor.write("SELECT FOR: " .. purpose_lbl)
@@ -775,7 +864,14 @@ local function render_face_picker()
     mon_btn(1, 1, "back_to_config", {x1 = 1, x2 = 6})
 
     -- Title
-    local purpose_lbl = config_purpose == "rail" and "POWERED RAIL" or "DETECTOR RAIL"
+    local purpose_labels = {
+        rail = "POWERED RAIL",
+        detector = "DETECTOR RAIL",
+        switch = "SWITCH",
+        bay_detector = "BAY DETECTOR",
+        bay_rail = "BAY POWERED RAIL",
+    }
+    local purpose_lbl = purpose_labels[config_purpose] or config_purpose
     monitor.setCursorPos(1, 2)
     monitor.setTextColor(colors.cyan)
     monitor.write("SELECT FACE: " .. purpose_lbl)
@@ -787,8 +883,10 @@ local function render_face_picker()
     local current_face
     if config_purpose == "rail" then
         current_face = station_config.rail_face
-    else
+    elseif config_purpose == "detector" then
         current_face = station_config.detector_face
+    else
+        current_face = nil  -- no default for new configs
     end
 
     local cy = 4
@@ -1099,10 +1197,45 @@ local function command_listener()
                     table.remove(station_config.rules, msg.idx)
                     save_config()
                 end
+
+            elseif msg.action == "dispatch_from_bay" then
+                local sw_idx = msg.switch_idx
+                if sw_idx and station_config.switches[sw_idx] then
+                    print(string.format("BAY %d DISPATCH", sw_idx))
+                    dispatch_from_bay(sw_idx)
+                end
+
+            elseif msg.action == "set_bay_rail" then
+                local sw_idx = msg.switch_idx
+                local sw = station_config.switches[sw_idx]
+                if sw and sw.parking then
+                    sw.bay_rail_periph = msg.peripheral_name or sw.bay_rail_periph
+                    sw.bay_rail_face = msg.face or sw.bay_rail_face
+                    save_config()
+                    bay_brake_on(sw_idx)
+                end
+
+            elseif msg.action == "set_bay_detector" then
+                local sw_idx = msg.switch_idx
+                local sw = station_config.switches[sw_idx]
+                if sw and sw.parking then
+                    sw.bay_detector_periph = msg.peripheral_name or sw.bay_detector_periph
+                    sw.bay_detector_face = msg.face or sw.bay_detector_face
+                    save_config()
+                    init_bay_states()
+                end
             end
 
             -- Send updated status back
             if WRAITH_ID then
+                -- Collect bay train states
+                local bay_train_states = {}
+                for i, sw in ipairs(station_config.switches) do
+                    if sw.parking then
+                        local bs = bay_states[i]
+                        bay_train_states[i] = bs and bs.has_train or false
+                    end
+                end
                 rednet.send(WRAITH_ID, {
                     rules = station_config.rules,
                     switches = station_config.switches,
@@ -1112,6 +1245,7 @@ local function command_listener()
                     detector_periph = station_config.detector_periph,
                     detector_face = station_config.detector_face,
                     has_train = has_train,
+                    bay_train_states = bay_train_states,
                 }, PROTOCOLS.status)
             end
 
@@ -1127,10 +1261,18 @@ local function heartbeat_sender()
     while true do
         sleep(HEARTBEAT_INTERVAL)
         if WRAITH_ID then
+            local bay_train_states = {}
+            for i, sw in ipairs(station_config.switches) do
+                if sw.parking then
+                    local bs = bay_states[i]
+                    bay_train_states[i] = bs and bs.has_train or false
+                end
+            end
             rednet.send(WRAITH_ID, {
                 id = os.getComputerID(),
                 label = station_config.label,
                 has_train = has_train,
+                bay_train_states = bay_train_states,
             }, PROTOCOLS.heartbeat)
         end
     end
@@ -1249,6 +1391,12 @@ local function monitor_touch_loop()
                     elseif config_purpose == "switch" then
                         pending_switch = {peripheral_name = btn.data.name}
                         monitor_mode = "pick_face"
+                    elseif config_purpose == "bay_detector" then
+                        pending_switch.bay_detector_periph = btn.data.name
+                        monitor_mode = "pick_face"
+                    elseif config_purpose == "bay_rail" then
+                        pending_switch.bay_rail_periph = btn.data.name
+                        monitor_mode = "pick_face"
                     end
                     render_monitor()
 
@@ -1267,6 +1415,43 @@ local function monitor_touch_loop()
                     elseif config_purpose == "switch" then
                         pending_switch.face = btn.data.face
                         monitor_mode = "switch_parking"
+                    elseif config_purpose == "bay_detector" then
+                        pending_switch.bay_detector_face = btn.data.face
+                        -- Continue to bay rail setup
+                        config_purpose = "bay_rail"
+                        monitor_mode = "pick_integrator"
+                    elseif config_purpose == "bay_rail" then
+                        pending_switch.bay_rail_face = btn.data.face
+                        -- All done, save the parking switch
+                        local sw_idx = #station_config.switches + 1
+                        table.insert(station_config.switches, {
+                            peripheral_name = pending_switch.peripheral_name,
+                            face = pending_switch.face,
+                            description = "Bay " .. sw_idx,
+                            state = false,
+                            routes = {},
+                            parking = true,
+                            bay_detector_periph = pending_switch.bay_detector_periph,
+                            bay_detector_face = pending_switch.bay_detector_face,
+                            bay_rail_periph = pending_switch.bay_rail_periph,
+                            bay_rail_face = pending_switch.bay_rail_face,
+                            bay_has_train = false,
+                        })
+                        save_config()
+                        -- Init bay state
+                        bay_states[sw_idx] = {
+                            last_signal = false,
+                            last_toggle_time = 0,
+                            has_train = false,
+                        }
+                        -- Brake the bay rail
+                        bay_brake_on(sw_idx)
+                        print("Parking bay added: " .. pending_switch.peripheral_name .. ":" .. pending_switch.face
+                            .. " det=" .. pending_switch.bay_detector_periph .. ":" .. pending_switch.bay_detector_face
+                            .. " rail=" .. pending_switch.bay_rail_periph .. ":" .. pending_switch.bay_rail_face)
+                        pending_switch = nil
+                        config_purpose = nil
+                        monitor_mode = "config"
                     end
                     render_monitor()
 
@@ -1278,22 +1463,30 @@ local function monitor_touch_loop()
 
                 elseif btn.action == "finish_switch" then
                     if pending_switch then
-                        table.insert(station_config.switches, {
-                            peripheral_name = pending_switch.peripheral_name,
-                            face = pending_switch.face,
-                            description = "Switch " .. (#station_config.switches + 1),
-                            state = false,
-                            routes = {},
-                            parking = btn.data.parking,
-                        })
-                        save_config()
-                        print("Switch added: " .. pending_switch.peripheral_name .. ":" .. pending_switch.face
-                            .. (btn.data.parking and " (PARKING)" or ""))
+                        pending_switch.parking = btn.data.parking
+                        if btn.data.parking then
+                            -- Parking bay: continue to bay detector setup
+                            config_purpose = "bay_detector"
+                            monitor_mode = "pick_integrator"
+                            render_monitor()
+                        else
+                            -- Regular switch: save now
+                            table.insert(station_config.switches, {
+                                peripheral_name = pending_switch.peripheral_name,
+                                face = pending_switch.face,
+                                description = "Switch " .. (#station_config.switches + 1),
+                                state = false,
+                                routes = {},
+                                parking = false,
+                            })
+                            save_config()
+                            print("Switch added: " .. pending_switch.peripheral_name .. ":" .. pending_switch.face)
+                            pending_switch = nil
+                            config_purpose = nil
+                            monitor_mode = "config"
+                            render_monitor()
+                        end
                     end
-                    pending_switch = nil
-                    config_purpose = nil
-                    monitor_mode = "config"
-                    render_monitor()
 
                 elseif btn.action == "remove_switch" then
                     local idx = btn.data.idx
@@ -1317,27 +1510,44 @@ local function monitor_touch_loop()
     end
 end
 
+local function check_all_bay_detectors()
+    for i, sw in ipairs(station_config.switches) do
+        if sw.parking and sw.bay_detector_periph then
+            check_bay_detector(i)
+        end
+    end
+end
+
 local function detector_loop()
     -- Event-driven: listen for AP "redstoneIntegrator" events (instant).
-    -- Fallback: poll every 0.5s for AP <0.8 where events don't exist.
+    -- Fallback: poll every DETECTOR_FALLBACK_POLL for AP <0.8 where events don't exist.
     print("[detector] Loop started (poll=" .. DETECTOR_FALLBACK_POLL .. "s)")
+    local bay_count = 0
+    for i, sw in ipairs(station_config.switches) do
+        if sw.parking and sw.bay_detector_periph then bay_count = bay_count + 1 end
+    end
+    print("[detector] Parking bays with detectors: " .. bay_count)
     local poll_timer = os.startTimer(DETECTOR_FALLBACK_POLL)
-    local poll_count = 0
 
     while true do
         local event, p1, p2 = os.pullEvent()
 
         if event == "redstoneIntegrator" then
-            -- p1 = side, p2 = peripheral name
-            print("[detector] EVENT: " .. tostring(p1) .. " from " .. tostring(p2))
             if p2 == station_config.detector_periph then
                 check_detector()
             end
+            -- Check if it matches any bay detector
+            for i, sw in ipairs(station_config.switches) do
+                if sw.parking and p2 == sw.bay_detector_periph then
+                    check_bay_detector(i)
+                end
+            end
         elseif event == "redstone" then
-            -- Vanilla redstone event (fires if integrator is local)
             check_detector()
+            check_all_bay_detectors()
         elseif event == "timer" and p1 == poll_timer then
             check_detector()
+            check_all_bay_detectors()
             poll_timer = os.startTimer(DETECTOR_FALLBACK_POLL)
         end
     end
