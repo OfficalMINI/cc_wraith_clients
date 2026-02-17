@@ -377,12 +377,18 @@ local function check_detector()
     end
 
     if detector_debug then
-        print(string.format("[det] %s:%s  digital=%s  analog=%s  has_train=%s",
-            station_config.detector_periph,
-            station_config.detector_face,
-            tostring(signal),
-            ok2 and tostring(analog) or "ERR",
-            tostring(has_train)))
+        -- Show ALL faces to find where signal actually is
+        local parts = {}
+        for _, f in ipairs({"top","bottom","north","south","east","west"}) do
+            local fok, fval = pcall(ri.getInput, f)
+            local fok2, fana = pcall(ri.getAnalogInput, f)
+            if (fok and fval) or (fok2 and fana and fana > 0) then
+                table.insert(parts, f .. "=" .. tostring(fana) .. "***")
+            else
+                table.insert(parts, f .. "=" .. tostring(fana or 0))
+            end
+        end
+        print("[det] " .. table.concat(parts, " "))
     end
 
     if signal and not has_train then
