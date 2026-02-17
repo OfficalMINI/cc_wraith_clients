@@ -352,57 +352,70 @@ brake_on()
 -- when input changes: event, side, peripheral_name.
 -- Slow fallback poll for older AP versions.
 
-local detector_errors = 0
+local detector_debug = true  -- verbose logging for every read
 
 local function check_detector()
     if not station_config.detector_periph then
-        if detector_errors == 0 then
-            print("[detector] NOT CONFIGURED - run setup")
-            detector_errors = 1
-        end
+        print("[det] NO PERIPH CONFIGURED")
         return false
     end
 
     local ri = get_integrator(station_config.detector_periph)
     if not ri then
-        if detector_errors == 0 then
-            print("[detector] Integrator not found: " .. station_config.detector_periph)
-            detector_errors = 1
-        end
+        print("[det] PERIPH NOT FOUND: " .. station_config.detector_periph)
         return false
     end
 
+    -- Read boolean input
     local ok, signal = pcall(ri.getInput, station_config.detector_face)
+    -- Also read analog for extra info
+    local ok2, analog = pcall(ri.getAnalogInput, station_config.detector_face)
+
     if not ok then
-        if detector_errors == 0 then
-            print("[detector] getInput failed: " .. tostring(signal))
-            detector_errors = 1
-        end
+        print("[det] getInput ERROR: " .. tostring(signal))
         return false
     end
 
-    detector_errors = 0  -- reset on successful read
+    if detector_debug then
+        print(string.format("[det] %s:%s  digital=%s  analog=%s  has_train=%s",
+            station_config.detector_periph,
+            station_config.detector_face,
+            tostring(signal),
+            ok2 and tostring(analog) or "ERR",
+            tostring(has_train)))
+    end
 
     if signal and not has_train then
         has_train = true
-        print(string.format("[detector] Train ARRIVED (%s:%s)",
-            station_config.detector_periph, station_config.detector_face))
+        print("[det] >>> TRAIN ARRIVED <<<")
     elseif not signal and has_train then
         has_train = false
-        print(string.format("[detector] Train DEPARTED (%s:%s)",
-            station_config.detector_periph, station_config.detector_face))
+        print("[det] >>> TRAIN DEPARTED <<<")
     end
     return true
 end
 
--- Initial check with status report
-print("[detector] Config: " .. tostring(station_config.detector_periph) .. ":" .. tostring(station_config.detector_face))
-local det_ok = check_detector()
-if det_ok then
-    print("[detector] Active - reading signal OK")
-else
-    print("[detector] INACTIVE - see error above")
+-- Initial diagnostics
+print("[det] === DETECTOR DIAGNOSTICS ===")
+print("[det] Configured periph: " .. tostring(station_config.detector_periph))
+print("[det] Configured face:   " .. tostring(station_config.detector_face))
+print("[det] Integrators on network: " .. #redstone_integrators)
+for _, ri in ipairs(redstone_integrators) do
+    print("[det] --- " .. ri.name .. " ---")
+    for _, face in ipairs({"top","bottom","north","south","east","west"}) do
+        local ok1, dig = pcall(ri.periph.getInput, face)
+        local ok2, ana = pcall(ri.periph.getAnalogInput, face)
+        local tag = ""
+        if (ok1 and dig) or (ok2 and ana and ana > 0) then tag = " ***" end
+        print(string.format("[det]   %s: d=%s a=%s%s",
+            face,
+            ok1 and tostring(dig) or "ERR:"..tostring(dig),
+            ok2 and tostring(ana) or "ERR:"..tostring(ana),
+            tag))
+    end
 end
+print("[det] ===========================")
+check_detector()
 
 -- ========================================
 -- Track Switch Control (via integrator)
@@ -1204,18 +1217,7 @@ local function detector_loop()
             -- Vanilla redstone event (fires if integrator is local)
             check_detector()
         elseif event == "timer" and p1 == poll_timer then
-            -- Fallback poll
             check_detector()
-            poll_count = poll_count + 1
-            -- Print periodic proof-of-life every 100 polls (~10s)
-            if poll_count % 100 == 0 then
-                local ri = get_integrator(station_config.detector_periph)
-                if ri then
-                    local ok, sig = pcall(ri.getInput, station_config.detector_face)
-                    print(string.format("[detector] poll #%d signal=%s",
-                        poll_count, ok and tostring(sig) or "ERR"))
-                end
-            end
             poll_timer = os.startTimer(DETECTOR_FALLBACK_POLL)
         end
     end
