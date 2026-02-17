@@ -177,21 +177,139 @@ local function get_integrator(periph_name)
     return nil
 end
 
--- Auto-assign first integrator if not configured
-if not station_config.rail_periph and #redstone_integrators > 0 then
-    station_config.rail_periph = redstone_integrators[1].name
-    print("Auto-assigned rail integrator: " .. station_config.rail_periph)
-    save_config()
-end
-if not station_config.detector_periph and #redstone_integrators > 0 then
-    -- Use second integrator if available, otherwise same as rail
-    if #redstone_integrators >= 2 then
-        station_config.detector_periph = redstone_integrators[2].name
-    else
-        station_config.detector_periph = redstone_integrators[1].name
+-- ========================================
+-- Interactive Setup
+-- ========================================
+-- Runs on first boot or when peripherals aren't configured.
+-- Also accessible by running: station_client setup
+
+local FACES = {"top", "bottom", "north", "south", "east", "west"}
+
+local function pick_number(prompt, max)
+    while true do
+        write(prompt)
+        local input = read()
+        local n = tonumber(input)
+        if n and n >= 1 and n <= max then return n end
+        print("Enter 1-" .. max)
     end
-    print("Auto-assigned detector integrator: " .. station_config.detector_periph)
+end
+
+local function pick_integrator(purpose)
+    print("")
+    print("== Select integrator for: " .. purpose .. " ==")
+    for i, ri in ipairs(redstone_integrators) do
+        print(string.format("  %d. %s", i, ri.name))
+    end
+    local idx = pick_number("Choice [1-" .. #redstone_integrators .. "]: ", #redstone_integrators)
+    return redstone_integrators[idx].name
+end
+
+local function pick_face(purpose, default)
+    print("")
+    print("== Select face for: " .. purpose .. " ==")
+    for i, f in ipairs(FACES) do
+        local mark = (f == default) and " (default)" or ""
+        print(string.format("  %d. %s%s", i, f, mark))
+    end
+    write("Choice [1-6, Enter=" .. default .. "]: ")
+    local input = read()
+    if input == "" then return default end
+    local n = tonumber(input)
+    if n and n >= 1 and n <= 6 then return FACES[n] end
+    return default
+end
+
+local function run_setup()
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("========================================")
+    print("  STATION SETUP - " .. station_config.label)
+    print("========================================")
+    print("")
+
+    scan_integrators()
+
+    if #redstone_integrators == 0 then
+        print("ERROR: No redstone integrators found!")
+        print("Connect integrators via wired modem and restart.")
+        print("")
+        print("Press any key to continue without setup...")
+        os.pullEvent("key")
+        return
+    end
+
+    print("Found " .. #redstone_integrators .. " integrator(s):")
+    for i, ri in ipairs(redstone_integrators) do
+        print(string.format("  %d. %s", i, ri.name))
+    end
+
+    -- Station label
+    print("")
+    write("Station name [" .. station_config.label .. "]: ")
+    local new_label = read()
+    if new_label ~= "" then
+        station_config.label = new_label
+    end
+
+    -- Powered rail integrator
+    station_config.rail_periph = pick_integrator("POWERED RAIL (output)")
+    station_config.rail_face = pick_face("powered rail face", station_config.rail_face)
+
+    -- Detector rail integrator
+    station_config.detector_periph = pick_integrator("DETECTOR RAIL (input)")
+    station_config.detector_face = pick_face("detector rail face", station_config.detector_face)
+
+    -- Track switches
+    print("")
+    write("Configure track switches? [y/N]: ")
+    local sw_ans = read()
+    if sw_ans == "y" or sw_ans == "Y" then
+        while true do
+            print("")
+            local sw_periph = pick_integrator("SWITCH #" .. (#station_config.switches + 1))
+            local sw_face = pick_face("switch output face", "top")
+            write("Switch description: ")
+            local sw_desc = read()
+            if sw_desc == "" then sw_desc = "Switch " .. (#station_config.switches + 1) end
+            table.insert(station_config.switches, {
+                peripheral_name = sw_periph,
+                face = sw_face,
+                description = sw_desc,
+                state = false,
+                routes = {},
+            })
+            print("Added: " .. sw_desc .. " [" .. sw_periph .. ":" .. sw_face .. "]")
+            write("Add another switch? [y/N]: ")
+            local more = read()
+            if more ~= "y" and more ~= "Y" then break end
+        end
+    end
+
     save_config()
+
+    print("")
+    print("========================================")
+    print("  Setup complete! Config saved.")
+    print("========================================")
+    print("  Rail:     " .. station_config.rail_periph .. ":" .. station_config.rail_face)
+    print("  Detector: " .. station_config.detector_periph .. ":" .. station_config.detector_face)
+    print("  Switches: " .. #station_config.switches)
+    print("========================================")
+    sleep(1)
+end
+
+-- Run setup if unconfigured or requested via command line arg
+local args = {...}
+if args[1] == "setup" then
+    run_setup()
+elseif not station_config.rail_periph or not station_config.detector_periph then
+    if #redstone_integrators > 0 then
+        run_setup()
+    else
+        print("WARNING: No integrators found and none configured!")
+        print("Run 'station_client setup' after connecting peripherals.")
+    end
 end
 
 -- ========================================
@@ -430,6 +548,12 @@ check_for_updates()
 -- ========================================
 local function discover_wraith()
     print("Searching for Wraith OS...")
+    -- Build integrator name list for Wraith
+    local integrator_names = {}
+    for _, ri in ipairs(redstone_integrators) do
+        table.insert(integrator_names, ri.name)
+    end
+
     rednet.broadcast({
         type = "station",
         label = station_config.label,
@@ -441,6 +565,7 @@ local function discover_wraith()
         detector_face = station_config.detector_face,
         switches = station_config.switches,
         storage_bays = station_config.storage_bays,
+        integrators = integrator_names,
         has_train = has_train,
     }, PROTOCOLS.ping)
 
@@ -458,6 +583,12 @@ end
 
 local function register_with_wraith()
     if not WRAITH_ID then return false end
+    -- Build integrator name list for Wraith
+    local integrator_names = {}
+    for _, ri in ipairs(redstone_integrators) do
+        table.insert(integrator_names, ri.name)
+    end
+
     rednet.send(WRAITH_ID, {
         label = station_config.label,
         x = my_x, y = my_y, z = my_z,
@@ -468,6 +599,7 @@ local function register_with_wraith()
         switches = station_config.switches,
         storage_bays = station_config.storage_bays,
         rules = station_config.rules,
+        integrators = integrator_names,
         has_train = has_train,
     }, PROTOCOLS.register)
     local sender, msg = rednet.receive(PROTOCOLS.status, 3)
