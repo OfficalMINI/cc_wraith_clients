@@ -1439,6 +1439,7 @@ check_for_updates()
 -- ========================================
 local function discover_hub()
     if station_config.is_hub then return true end
+    print("[discovery] Broadcasting ping on " .. PROTOCOLS.ping .. "...")
     rednet.broadcast({
         type = "station_ping",
         label = station_config.label,
@@ -1451,9 +1452,10 @@ local function discover_hub()
         if msg.stations then
             route_data = msg.stations
         end
-        print("Found hub at #" .. sender)
+        print("[discovery] Found hub at #" .. sender)
         return true
     end
+    print("[discovery] No response (timeout " .. DISCOVERY_TIMEOUT .. "s)")
     return false
 end
 
@@ -1542,10 +1544,15 @@ local function command_listener()
     while true do
         local sender, msg, proto = rednet.receive(nil, 1)
 
+        if sender then
+            print("[net] from #" .. sender .. " proto=" .. tostring(proto))
+        end
+
         if sender and type(msg) == "table" then
 
             -- Hub: handle pings from remote stations
             if station_config.is_hub and proto == PROTOCOLS.ping then
+                print("[hub] Ping from #" .. sender .. " (" .. (msg.label or "?") .. ")")
                 rednet.send(sender, {
                     status = "hub_ack",
                     stations = get_station_list(),
