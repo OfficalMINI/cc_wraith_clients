@@ -2,19 +2,20 @@
 -- WRAITH OS - STATION CLIENT
 -- =============================================
 -- Run on wireless modem PCs at each train station.
--- Controls powered rail (brake/dispatch), track switches
--- via redstone integrator, monitors for route display,
--- and syncs with Wraith OS.
+-- All redstone I/O (powered rail, detector rail, switches)
+-- uses Advanced Peripherals redstone integrators
+-- connected via wired modem.
 --
--- Setup: Place computer at station with wireless modem.
+-- Setup: Place computer at station with wireless + wired modem.
+--        Connect redstone integrators via wired modem network.
 --        Attach monitor for route map display.
---        Configure rail_side for powered rail redstone.
---        Optional: attach redstoneIntegrator for switches.
+--        Configure rail integrator + face for powered rail output.
+--        Configure detector integrator + face for detector rail input.
 --        Run: station_client
 
 local CLIENT_TYPE = "station_client"
 
--- Compute version hash from own file content (must match updater_svc algorithm)
+-- Compute version hash from own file content
 local function compute_version()
     local path = shell.getRunningProgram()
     local f = fs.open(path, "r")
@@ -28,6 +29,7 @@ local function compute_version()
     return tostring(sum)
 end
 local VERSION = compute_version()
+local UPDATE_URL = "https://raw.githubusercontent.com/OfficalMINI/cc_wraith_clients/refs/heads/main/station_client.lua"
 local WRAITH_ID = nil
 
 local PROTOCOLS = {
@@ -37,15 +39,11 @@ local PROTOCOLS = {
     command   = "wraith_rail_st_cmd",
     heartbeat = "wraith_rail_st_hb",
 }
-local UPDATE_PROTO = {
-    ping = "wraith_update_ping",
-    push = "wraith_update_push",
-    ack  = "wraith_update_ack",
-}
 local HEARTBEAT_INTERVAL = 5
 local DISCOVERY_INTERVAL = 10
 local DISCOVERY_TIMEOUT = 3
-local DISPATCH_PULSE = 1.5   -- seconds to power rail for dispatch
+local DISPATCH_PULSE = 1.5       -- seconds to power rail for dispatch
+local DETECTOR_POLL = 0.25       -- poll detector integrator every N seconds
 
 -- ========================================
 -- Config Persistence
@@ -54,7 +52,10 @@ local CONFIG_FILE = "station_config.lua"
 
 local station_config = {
     label = nil,               -- station name
-    rail_side = "back",        -- redstone side for powered rail
+    rail_periph = nil,         -- peripheral name of redstone integrator for powered rail
+    rail_face = "top",          -- face on the integrator for powered rail output
+    detector_periph = nil,     -- peripheral name of redstone integrator for detector rail
+    detector_face = "top",      -- face on the integrator for detector rail input
     switches = {},             -- {{peripheral_name, face, description, routes}, ...}
     storage_bays = {},         -- {{switch_idx, description}, ...}
     rules = {},                -- automation rules
@@ -148,37 +149,76 @@ else
     print("No monitor (route display disabled)")
 end
 
--- Redstone Integrators (Advanced Peripherals) for track switches
+-- Redstone Integrators (Advanced Peripherals) via wired modem
 local redstone_integrators = {}
-for _, name in ipairs(peripheral.getNames()) do
-    local ptype = peripheral.getType(name)
-    if ptype == "redstoneIntegrator" then
-        table.insert(redstone_integrators, {
-            name = name,
-            periph = peripheral.wrap(name),
-        })
+local function scan_integrators()
+    redstone_integrators = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        local ptype = peripheral.getType(name)
+        if ptype == "redstoneIntegrator" then
+            table.insert(redstone_integrators, {
+                name = name,
+                periph = peripheral.wrap(name),
+            })
+        end
     end
 end
+scan_integrators()
 print("Redstone integrators: " .. #redstone_integrators)
 
+-- Helper: find integrator by peripheral name
+local function get_integrator(periph_name)
+    if not periph_name then return nil end
+    for _, ri in ipairs(redstone_integrators) do
+        if ri.name == periph_name then
+            return ri.periph
+        end
+    end
+    return nil
+end
+
+-- Auto-assign first integrator if not configured
+if not station_config.rail_periph and #redstone_integrators > 0 then
+    station_config.rail_periph = redstone_integrators[1].name
+    print("Auto-assigned rail integrator: " .. station_config.rail_periph)
+    save_config()
+end
+if not station_config.detector_periph and #redstone_integrators > 0 then
+    -- Use second integrator if available, otherwise same as rail
+    if #redstone_integrators >= 2 then
+        station_config.detector_periph = redstone_integrators[2].name
+    else
+        station_config.detector_periph = redstone_integrators[1].name
+    end
+    print("Auto-assigned detector integrator: " .. station_config.detector_periph)
+    save_config()
+end
+
 -- ========================================
--- Powered Rail Control
+-- Powered Rail Control (via integrator)
 -- ========================================
 -- Default: unpowered (brake). Power briefly to dispatch.
 
-local has_train = false   -- assume no train until detected
+local has_train = false   -- detected by detector rail integrator
 
 local function brake_on()
-    -- Ensure rail is unpowered (stops incoming trains)
-    rs.setOutput(station_config.rail_side, false)
+    local ri = get_integrator(station_config.rail_periph)
+    if ri then
+        pcall(ri.setOutput, station_config.rail_face, false)
+    end
 end
 
 local function dispatch()
-    -- Power the rail to launch train, then return to brake
-    print("Dispatching: powering rail on " .. station_config.rail_side)
-    rs.setOutput(station_config.rail_side, true)
+    local ri = get_integrator(station_config.rail_periph)
+    if not ri then
+        print("ERROR: Rail integrator not found: " .. tostring(station_config.rail_periph))
+        return
+    end
+    print(string.format("Dispatching: %s:%s -> ON",
+        station_config.rail_periph, station_config.rail_face))
+    pcall(ri.setOutput, station_config.rail_face, true)
     os.sleep(DISPATCH_PULSE)
-    rs.setOutput(station_config.rail_side, false)
+    pcall(ri.setOutput, station_config.rail_face, false)
     has_train = false
     print("Dispatch complete, rail braked")
 end
@@ -187,35 +227,48 @@ end
 brake_on()
 
 -- ========================================
--- Track Switch Control
+-- Detector Rail Monitoring (via integrator)
+-- ========================================
+-- Detector rails output redstone when a minecart sits on them.
+-- We poll the integrator's getInput() since network peripherals
+-- don't trigger os.pullEvent("redstone").
+
+local function check_detector()
+    local ri = get_integrator(station_config.detector_periph)
+    if not ri then return end
+
+    local ok, signal = pcall(ri.getInput, station_config.detector_face)
+    if not ok then return end
+
+    if signal and not has_train then
+        has_train = true
+        print(string.format("Train ARRIVED (%s:%s)",
+            station_config.detector_periph, station_config.detector_face))
+    elseif not signal and has_train then
+        has_train = false
+        print(string.format("Train DEPARTED (%s:%s)",
+            station_config.detector_periph, station_config.detector_face))
+    end
+end
+
+-- Initial check
+check_detector()
+
+-- ========================================
+-- Track Switch Control (via integrator)
 -- ========================================
 
 local function set_switch(switch_idx, state_on)
     local sw = station_config.switches[switch_idx]
     if not sw then return false end
 
-    -- Find the redstone integrator for this switch
-    local periph = nil
-    for _, ri in ipairs(redstone_integrators) do
-        if ri.name == sw.peripheral_name then
-            periph = ri.periph
-            break
-        end
-    end
-
+    local periph = get_integrator(sw.peripheral_name)
     if not periph then
-        -- Fallback: try direct redstone if face matches a side
-        local valid_sides = {top=true, bottom=true, left=true, right=true, front=true, back=true}
-        if valid_sides[sw.face] then
-            rs.setOutput(sw.face, state_on)
-            sw.state = state_on
-            save_config()
-            return true
-        end
+        print(string.format("Switch %d: integrator '%s' not found",
+            switch_idx, tostring(sw.peripheral_name)))
         return false
     end
 
-    -- Use redstone integrator
     local ok = pcall(periph.setOutput, sw.face, state_on)
     if ok then
         sw.state = state_on
@@ -259,7 +312,7 @@ local function render_monitor()
     monitor.write("Train: ")
     if has_train then
         monitor.setTextColor(colors.lime)
-        monitor.write("READY")
+        monitor.write("DETECTED")
     else
         monitor.setTextColor(colors.gray)
         monitor.write("NONE")
@@ -332,30 +385,42 @@ local function render_monitor()
 end
 
 -- ========================================
--- Update Check
+-- Update Check (GitHub HTTP)
 -- ========================================
 local function check_for_updates()
-    print("Checking for updates...")
-    rednet.broadcast(
-        {client_type = CLIENT_TYPE, version = VERSION},
-        UPDATE_PROTO.ping
-    )
-    local sender, msg = rednet.receive(UPDATE_PROTO.push, 3)
-    if msg and type(msg) == "table" and msg.content then
-        print("Update received! Installing...")
-        local path = shell.getRunningProgram()
-        local f = fs.open(path, "w")
-        if f then
-            f.write(msg.content)
-            f.close()
-            rednet.send(sender, {client_type = CLIENT_TYPE}, UPDATE_PROTO.ack)
-            print("Update installed. Rebooting...")
-            sleep(0.5)
-            os.reboot()
-        end
-    else
-        print("No updates available.")
+    print("[update] Checking github...")
+    local ok, resp = pcall(http.get, UPDATE_URL)
+    if not ok or not resp then
+        print("[update] Fetch failed")
+        return false
     end
+    local content = resp.readAll()
+    resp.close()
+    if not content or #content < 100 then
+        print("[update] Bad response (" .. (content and #content or 0) .. "b)")
+        return false
+    end
+    local sum = 0
+    for i = 1, #content do
+        sum = (sum * 31 + string.byte(content, i)) % 2147483647
+    end
+    local remote_ver = tostring(sum)
+    if remote_ver == VERSION then
+        print("[update] Up to date (ver=" .. VERSION .. ")")
+        return false
+    end
+    print("[update] New version! " .. VERSION .. " -> " .. remote_ver .. " (" .. #content .. "b)")
+    local path = shell.getRunningProgram()
+    local f = fs.open(path, "w")
+    if not f then
+        print("[update] ERROR: can't write " .. path)
+        return false
+    end
+    f.write(content)
+    f.close()
+    print("[update] Written. Rebooting...")
+    sleep(0.5)
+    os.reboot()
 end
 
 check_for_updates()
@@ -370,7 +435,10 @@ local function discover_wraith()
         label = station_config.label,
         id = os.getComputerID(),
         x = my_x, y = my_y, z = my_z,
-        rail_side = station_config.rail_side,
+        rail_periph = station_config.rail_periph,
+        rail_face = station_config.rail_face,
+        detector_periph = station_config.detector_periph,
+        detector_face = station_config.detector_face,
         switches = station_config.switches,
         storage_bays = station_config.storage_bays,
         has_train = has_train,
@@ -393,7 +461,10 @@ local function register_with_wraith()
     rednet.send(WRAITH_ID, {
         label = station_config.label,
         x = my_x, y = my_y, z = my_z,
-        rail_side = station_config.rail_side,
+        rail_periph = station_config.rail_periph,
+        rail_face = station_config.rail_face,
+        detector_periph = station_config.detector_periph,
+        detector_face = station_config.detector_face,
         switches = station_config.switches,
         storage_bays = station_config.storage_bays,
         rules = station_config.rules,
@@ -437,12 +508,14 @@ term.clear()
 term.setCursorPos(1, 1)
 print("=== Station Client v" .. VERSION .. " ===")
 print("Computer #" .. os.getComputerID())
-print("Station:   " .. station_config.label)
-print("Wraith:    #" .. tostring(WRAITH_ID))
-print("Position:  " .. my_x .. ", " .. my_y .. ", " .. my_z)
-print("Rail side: " .. station_config.rail_side)
-print("Switches:  " .. #station_config.switches)
-print("Monitor:   " .. (monitor and "YES" or "NO"))
+print("Station:    " .. station_config.label)
+print("Wraith:     #" .. tostring(WRAITH_ID))
+print("Position:   " .. my_x .. ", " .. my_y .. ", " .. my_z)
+print("Rail:       " .. tostring(station_config.rail_periph) .. ":" .. station_config.rail_face)
+print("Detector:   " .. tostring(station_config.detector_periph) .. ":" .. station_config.detector_face)
+print("Integrators:" .. #redstone_integrators)
+print("Switches:   " .. #station_config.switches)
+print("Monitor:    " .. (monitor and "YES" or "NO"))
 print("")
 print("Listening for commands...")
 print("")
@@ -459,12 +532,10 @@ local function command_listener()
 
         if sender and proto == PROTOCOLS.command and type(msg) == "table" then
             if msg.action == "dispatch" then
-                -- Dispatch command from Wraith
                 print(string.format("DISPATCH to %s", msg.destination_label or "?"))
                 dispatch()
 
             elseif msg.action == "set_switch" then
-                -- Switch control from Wraith
                 local sw_idx = msg.switch_idx
                 local sw_state = msg.state
                 if sw_idx then
@@ -472,15 +543,24 @@ local function command_listener()
                 end
 
             elseif msg.action == "brake" then
-                -- Emergency brake
                 brake_on()
 
-            elseif msg.action == "set_rail_side" then
-                -- Configure rail side
-                station_config.rail_side = msg.side or "back"
+            elseif msg.action == "set_rail" then
+                -- Configure rail integrator + face
+                station_config.rail_periph = msg.peripheral_name or station_config.rail_periph
+                station_config.rail_face = msg.face or station_config.rail_face
                 save_config()
                 brake_on()
-                print("Rail side set to: " .. station_config.rail_side)
+                print(string.format("Rail set to: %s:%s",
+                    station_config.rail_periph, station_config.rail_face))
+
+            elseif msg.action == "set_detector" then
+                -- Configure detector integrator + face
+                station_config.detector_periph = msg.peripheral_name or station_config.detector_periph
+                station_config.detector_face = msg.face or station_config.detector_face
+                save_config()
+                print(string.format("Detector set to: %s:%s",
+                    station_config.detector_periph, station_config.detector_face))
 
             elseif msg.action == "set_label" then
                 station_config.label = msg.label
@@ -506,7 +586,6 @@ local function command_listener()
                 end
 
             elseif msg.action == "update_routes" then
-                -- Update route map data for monitor display
                 if msg.stations then
                     route_data = msg
                 end
@@ -531,13 +610,15 @@ local function command_listener()
                     rules = station_config.rules,
                     switches = station_config.switches,
                     storage_bays = station_config.storage_bays,
-                    rail_side = station_config.rail_side,
+                    rail_periph = station_config.rail_periph,
+                    rail_face = station_config.rail_face,
+                    detector_periph = station_config.detector_periph,
+                    detector_face = station_config.detector_face,
                     has_train = has_train,
                 }, PROTOCOLS.status)
             end
 
         elseif sender and proto == PROTOCOLS.status then
-            -- Status response (e.g. route updates)
             if type(msg) == "table" and msg.stations then
                 route_data = msg.stations
             end
@@ -605,11 +686,9 @@ local function monitor_touch_loop()
     end
     while true do
         local ev, side, tx, ty = os.pullEvent("monitor_touch")
-        -- Check destination button presses
         for _, btn in ipairs(dest_buttons) do
             if ty == btn.y and has_train then
                 print("Destination selected: " .. btn.label)
-                -- Request dispatch via Wraith
                 if WRAITH_ID then
                     rednet.send(WRAITH_ID, {
                         action = "request_dispatch",
@@ -617,11 +696,20 @@ local function monitor_touch_loop()
                         to = btn.id,
                     }, PROTOCOLS.status)
                 end
-                -- Also dispatch locally
                 dispatch()
                 break
             end
         end
+    end
+end
+
+local function detector_loop()
+    -- Poll detector integrator for train arrivals.
+    -- Network peripherals don't fire local redstone events,
+    -- so we poll on a timer.
+    while true do
+        check_detector()
+        os.sleep(DETECTOR_POLL)
     end
 end
 
@@ -638,5 +726,6 @@ parallel.waitForAll(
     discovery_loop,
     monitor_loop,
     monitor_touch_loop,
+    detector_loop,
     update_checker
 )

@@ -8,8 +8,9 @@
 --        Run: crafting_client
 
 local CLIENT_TYPE = "crafting_client"
+local UPDATE_URL = "https://raw.githubusercontent.com/OfficalMINI/cc_wraith_clients/refs/heads/main/crafting_client.lua"
 
--- Compute version hash from own file content (must match updater_svc algorithm)
+-- Compute version hash from own file content
 local function compute_version()
     local path = shell.getRunningProgram()
     local f = fs.open(path, "r")
@@ -30,12 +31,6 @@ local PROTOCOLS = {
     status  = "wraith_craft_status",
     command = "wraith_craft_cmd",
     result  = "wraith_craft_result",
-}
-
-local UPDATE_PROTO = {
-    ping = "wraith_update_ping",
-    push = "wraith_update_push",
-    ack  = "wraith_update_ack",
 }
 
 local HEARTBEAT_INTERVAL = 5
@@ -117,30 +112,42 @@ end
 print()
 
 -- ========================================
--- Update Check
+-- Update Check (GitHub)
 -- ========================================
 local function check_for_updates()
-    print("Checking for updates...")
-    rednet.broadcast(
-        {client_type = CLIENT_TYPE, version = VERSION},
-        UPDATE_PROTO.ping
-    )
-    local sender, msg = rednet.receive(UPDATE_PROTO.push, 3)
-    if msg and type(msg) == "table" and msg.content then
-        print("Update received! Installing...")
-        local path = shell.getRunningProgram()
-        local f = fs.open(path, "w")
-        if f then
-            f.write(msg.content)
-            f.close()
-            rednet.send(sender, {client_type = CLIENT_TYPE}, UPDATE_PROTO.ack)
-            print("Update installed. Rebooting...")
-            sleep(0.5)
-            os.reboot()
-        end
-    else
-        print("No updates available.")
+    print("[update] Checking github...")
+    local ok, resp = pcall(http.get, UPDATE_URL)
+    if not ok or not resp then
+        print("[update] Fetch failed")
+        return false
     end
+    local content = resp.readAll()
+    resp.close()
+    if not content or #content < 100 then
+        print("[update] Bad response (" .. (content and #content or 0) .. "b)")
+        return false
+    end
+    local sum = 0
+    for i = 1, #content do
+        sum = (sum * 31 + string.byte(content, i)) % 2147483647
+    end
+    local remote_ver = tostring(sum)
+    if remote_ver == VERSION then
+        print("[update] Up to date (ver=" .. VERSION .. ")")
+        return false
+    end
+    print("[update] New version! " .. VERSION .. " -> " .. remote_ver .. " (" .. #content .. "b)")
+    local path = shell.getRunningProgram()
+    local f = fs.open(path, "w")
+    if not f then
+        print("[update] ERROR: can't write " .. path)
+        return false
+    end
+    f.write(content)
+    f.close()
+    print("[update] Written. Rebooting...")
+    sleep(0.5)
+    os.reboot()
 end
 
 check_for_updates()
