@@ -180,6 +180,11 @@ local function scan_integrators()
     end
 end
 scan_integrators()
+-- Wired modem peripherals may not be ready immediately on boot
+if #redstone_integrators == 0 then
+    os.sleep(0.5)
+    scan_integrators()
+end
 print("Redstone integrators: " .. #redstone_integrators)
 
 -- Helper: find integrator by peripheral name
@@ -410,6 +415,26 @@ end
 local args = {...}
 if args[1] == "setup" then
     run_setup()
+elseif args[1] == "name" then
+    local name = table.concat(args, " ", 2)
+    if name ~= "" then
+        station_config.label = name
+        save_config()
+        print("Station renamed to: " .. station_config.label)
+    else
+        print("Usage: station_client name <name>")
+    end
+    return
+elseif args[1] == "hub" then
+    station_config.is_hub = true
+    save_config()
+    print("Set as HUB station. Restart to apply.")
+    return
+elseif args[1] == "remote" then
+    station_config.is_hub = false
+    save_config()
+    print("Set as REMOTE station. Restart to apply.")
+    return
 elseif not station_config.rail_periph or not station_config.detector_periph then
     if #redstone_integrators > 0 then
         run_setup()
@@ -2127,6 +2152,82 @@ local function player_check_loop()
     end
 end
 
+local function terminal_input()
+    print("")
+    print("Commands: name, hub, remote, setup, status, help")
+    print("")
+    while true do
+        write("> ")
+        local input = read()
+        if input then
+            local parts = {}
+            for word in input:gmatch("%S+") do
+                table.insert(parts, word)
+            end
+            local cmd = parts[1]
+
+            if cmd == "name" then
+                local name = table.concat(parts, " ", 2)
+                if name ~= "" then
+                    station_config.label = name
+                    save_config()
+                    print("Renamed to: " .. name)
+                else
+                    print("Current: " .. station_config.label)
+                    write("New name: ")
+                    local new_name = read()
+                    if new_name and new_name ~= "" then
+                        station_config.label = new_name
+                        save_config()
+                        print("Renamed to: " .. new_name)
+                    end
+                end
+
+            elseif cmd == "hub" then
+                station_config.is_hub = true
+                HUB_ID = os.getComputerID()
+                save_config()
+                print("Set as HUB. Restart recommended.")
+
+            elseif cmd == "remote" then
+                station_config.is_hub = false
+                HUB_ID = nil
+                save_config()
+                print("Set as REMOTE. Restart recommended.")
+
+            elseif cmd == "setup" then
+                run_setup()
+
+            elseif cmd == "status" then
+                print("Station:  " .. station_config.label)
+                print("Mode:     " .. (station_config.is_hub and "HUB" or "REMOTE"))
+                print("Train:    " .. (has_train and "YES" or "NO"))
+                print("Hub ID:   " .. (HUB_ID and ("#" .. HUB_ID) or "NONE"))
+                print("Integrs:  " .. #redstone_integrators)
+                print("Switches: " .. #station_config.switches)
+
+            elseif cmd == "rescan" then
+                scan_integrators()
+                scan_player_detectors()
+                print("Found " .. #redstone_integrators .. " integrators, " .. #player_detectors .. " player detectors")
+
+            elseif cmd == "help" then
+                print("Commands:")
+                print("  name [text]  - rename station")
+                print("  hub          - set as hub station")
+                print("  remote       - set as remote station")
+                print("  setup        - run full setup wizard")
+                print("  status       - show current status")
+                print("  rescan       - rescan peripherals")
+                print("  help         - show this help")
+
+            elseif cmd and cmd ~= "" then
+                print("Unknown: " .. cmd .. " (type 'help')")
+            end
+        end
+    end
+end
+
 local function update_checker()
     while true do
         sleep(300)
@@ -2143,5 +2244,6 @@ parallel.waitForAll(
     monitor_touch_loop,
     detector_loop,
     player_check_loop,
+    terminal_input,
     update_checker
 )
