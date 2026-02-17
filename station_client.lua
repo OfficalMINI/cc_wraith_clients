@@ -544,11 +544,8 @@ local function dispatch_from_bay(sw_idx)
     pcall(ri.setOutput, sw.bay_rail_face, true)
     os.sleep(DISPATCH_PULSE)
     pcall(ri.setOutput, sw.bay_rail_face, false)
-    if bay_states[sw_idx] then
-        bay_states[sw_idx].has_train = false
-    end
-    sw.bay_has_train = false
-    save_config()
+    -- Don't clear bay_has_train here — let the detector rail confirm
+    -- the train actually left by toggling when it passes over
     print("Bay " .. sw_idx .. " dispatch complete, rail braked")
 end
 
@@ -706,9 +703,10 @@ check_detector()
 local route_data = nil   -- station list from hub (for remote stations)
 
 -- Monitor UI state
-local monitor_mode = "main"  -- "main", "config", "pick_integrator", "pick_face", "switch_face", "switch_parking", "pick_player_det"
-local config_purpose = nil   -- "rail", "detector", "switch", "bay_detector", "bay_rail"
+local monitor_mode = "main"  -- "main", "config", "pick_integrator", "pick_face", "switch_face", "switch_parking", "pick_player_det", "edit_switch"
+local config_purpose = nil   -- "rail", "detector", "switch", "bay_detector", "bay_rail", "edit_sw_integrator", "edit_sw_bay_detector", "edit_sw_bay_rail"
 local pending_switch = nil   -- temp switch being built
+local editing_switch_idx = nil  -- index of switch being edited (nil = adding new)
 local monitor_buttons = {}   -- rebuilt each render
 
 local function mon_btn(y1, y2, action, data)
@@ -1120,6 +1118,8 @@ local function render_config_monitor()
         monitor.write(string.format("%d.%s %s [%s]",
             si, tag, (sw.description or "Switch"):sub(1, mw - 14),
             sw.state and "ON" or "OFF"))
+        -- Edit button (tap switch row)
+        mon_btn(cy, cy, "edit_switch", {idx = si, x1 = 1, x2 = mw - 4})
         -- Delete button
         monitor.setCursorPos(mw - 2, cy)
         monitor.setBackgroundColor(colors.red)
@@ -1343,6 +1343,122 @@ local function render_switch_parking()
     mon_btn(10, 10, "finish_switch", {parking = false})
 end
 
+local function render_edit_switch()
+    if not monitor or not editing_switch_idx then return end
+    local sw = station_config.switches[editing_switch_idx]
+    if not sw then
+        monitor_mode = "config"
+        editing_switch_idx = nil
+        return
+    end
+
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    -- Back button
+    monitor.setCursorPos(1, 1)
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(colors.white)
+    monitor.write("< BACK")
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(1, 1, "back_to_config", {x1 = 1, x2 = 6})
+
+    -- Title
+    monitor.setCursorPos(1, 2)
+    monitor.setTextColor(colors.cyan)
+    monitor.write("EDIT: " .. (sw.description or "Switch " .. editing_switch_idx))
+
+    monitor.setCursorPos(1, 3)
+    monitor.setTextColor(colors.gray)
+    monitor.write(string.rep("-", mw))
+
+    local cy = 4
+
+    -- Switch integrator
+    monitor.setCursorPos(1, cy)
+    monitor.setTextColor(colors.white)
+    monitor.write("Switch:")
+    cy = cy + 1
+    monitor.setCursorPos(2, cy)
+    monitor.setTextColor(colors.yellow)
+    local sw_lbl = (sw.peripheral_name or "?"):sub(1, mw - 12) .. ":" .. (sw.face or "?")
+    monitor.write(sw_lbl)
+    monitor.setCursorPos(mw - 4, cy)
+    monitor.setBackgroundColor(colors.blue)
+    monitor.setTextColor(colors.white)
+    monitor.write("[CHG]")
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(cy, cy, "edit_sw_change_integrator", {x1 = mw - 4, x2 = mw})
+    cy = cy + 2
+
+    -- Parking toggle
+    monitor.setCursorPos(1, cy)
+    monitor.setTextColor(colors.white)
+    monitor.write("Parking: ")
+    if sw.parking then
+        monitor.setBackgroundColor(colors.green)
+        monitor.write(" YES ")
+    else
+        monitor.setBackgroundColor(colors.gray)
+        monitor.write(" NO  ")
+    end
+    monitor.setBackgroundColor(colors.black)
+    monitor.write(" ")
+    monitor.setBackgroundColor(colors.blue)
+    monitor.write("[TOG]")
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(cy, cy, "edit_sw_toggle_parking", {})
+    cy = cy + 1
+
+    -- Bay config (only if parking)
+    if sw.parking then
+        cy = cy + 1
+        monitor.setCursorPos(1, cy)
+        monitor.setTextColor(colors.white)
+        monitor.write("Bay Detector:")
+        cy = cy + 1
+        monitor.setCursorPos(2, cy)
+        monitor.setTextColor(colors.yellow)
+        local bd_lbl = (sw.bay_detector_periph or "NOT SET"):sub(1, mw - 12) .. ":" .. (sw.bay_detector_face or "?")
+        monitor.write(bd_lbl)
+        monitor.setCursorPos(mw - 4, cy)
+        monitor.setBackgroundColor(colors.blue)
+        monitor.setTextColor(colors.white)
+        monitor.write("[CHG]")
+        monitor.setBackgroundColor(colors.black)
+        mon_btn(cy, cy, "edit_sw_change_bay_det", {x1 = mw - 4, x2 = mw})
+        cy = cy + 2
+
+        monitor.setCursorPos(1, cy)
+        monitor.setTextColor(colors.white)
+        monitor.write("Bay Rail:")
+        cy = cy + 1
+        monitor.setCursorPos(2, cy)
+        monitor.setTextColor(colors.yellow)
+        local br_lbl = (sw.bay_rail_periph or "NOT SET"):sub(1, mw - 12) .. ":" .. (sw.bay_rail_face or "?")
+        monitor.write(br_lbl)
+        monitor.setCursorPos(mw - 4, cy)
+        monitor.setBackgroundColor(colors.blue)
+        monitor.setTextColor(colors.white)
+        monitor.write("[CHG]")
+        monitor.setBackgroundColor(colors.black)
+        mon_btn(cy, cy, "edit_sw_change_bay_rail", {x1 = mw - 4, x2 = mw})
+        cy = cy + 2
+    end
+
+    -- Delete button
+    cy = cy + 1
+    if cy <= mh then
+        monitor.setCursorPos(1, cy)
+        monitor.setBackgroundColor(colors.red)
+        monitor.setTextColor(colors.white)
+        monitor.write(" DELETE SWITCH ")
+        monitor.setBackgroundColor(colors.black)
+        mon_btn(cy, cy, "remove_switch", {idx = editing_switch_idx, x1 = 1, x2 = 14})
+    end
+end
+
 local function render_player_detector_picker()
     if not monitor then return end
 
@@ -1404,6 +1520,8 @@ local function render_monitor()
         render_face_picker()
     elseif monitor_mode == "switch_parking" then
         render_switch_parking()
+    elseif monitor_mode == "edit_switch" then
+        render_edit_switch()
     elseif monitor_mode == "pick_player_det" then
         render_player_detector_picker()
     else
@@ -1938,7 +2056,13 @@ local function monitor_touch_loop()
                     render_monitor()
 
                 elseif btn.action == "back_to_config" then
-                    monitor_mode = "config"
+                    if editing_switch_idx and (config_purpose or ""):find("^edit_sw") then
+                        -- Return to edit switch screen when backing out of edit sub-flow
+                        monitor_mode = "edit_switch"
+                    else
+                        monitor_mode = "config"
+                        editing_switch_idx = nil
+                    end
                     config_purpose = nil
                     render_monitor()
 
@@ -2030,6 +2154,18 @@ local function monitor_touch_loop()
                     elseif config_purpose == "bay_rail" then
                         pending_switch.bay_rail_periph = btn.data.name
                         monitor_mode = "pick_face"
+                    elseif config_purpose == "edit_sw_integrator" then
+                        local sw = station_config.switches[editing_switch_idx]
+                        if sw then sw.peripheral_name = btn.data.name end
+                        monitor_mode = "pick_face"
+                    elseif config_purpose == "edit_sw_bay_detector" then
+                        local sw = station_config.switches[editing_switch_idx]
+                        if sw then sw.bay_detector_periph = btn.data.name end
+                        monitor_mode = "pick_face"
+                    elseif config_purpose == "edit_sw_bay_rail" then
+                        local sw = station_config.switches[editing_switch_idx]
+                        if sw then sw.bay_rail_periph = btn.data.name end
+                        monitor_mode = "pick_face"
                     end
                     render_monitor()
 
@@ -2052,6 +2188,30 @@ local function monitor_touch_loop()
                         pending_switch.bay_detector_face = btn.data.face
                         config_purpose = "bay_rail"
                         monitor_mode = "pick_integrator"
+                    elseif config_purpose == "edit_sw_integrator" then
+                        local sw = station_config.switches[editing_switch_idx]
+                        if sw then
+                            sw.face = btn.data.face
+                            save_config()
+                        end
+                        config_purpose = nil
+                        monitor_mode = "edit_switch"
+                    elseif config_purpose == "edit_sw_bay_detector" then
+                        local sw = station_config.switches[editing_switch_idx]
+                        if sw then
+                            sw.bay_detector_face = btn.data.face
+                            save_config()
+                        end
+                        config_purpose = nil
+                        monitor_mode = "edit_switch"
+                    elseif config_purpose == "edit_sw_bay_rail" then
+                        local sw = station_config.switches[editing_switch_idx]
+                        if sw then
+                            sw.bay_rail_face = btn.data.face
+                            save_config()
+                        end
+                        config_purpose = nil
+                        monitor_mode = "edit_switch"
                     elseif config_purpose == "bay_rail" then
                         pending_switch.bay_rail_face = btn.data.face
                         local sw_idx = #station_config.switches + 1
@@ -2119,6 +2279,50 @@ local function monitor_touch_loop()
                         table.remove(station_config.switches, idx)
                         save_config()
                     end
+                    editing_switch_idx = nil
+                    monitor_mode = "config"
+                    render_monitor()
+
+                elseif btn.action == "edit_switch" then
+                    editing_switch_idx = btn.data.idx
+                    monitor_mode = "edit_switch"
+                    render_monitor()
+
+                elseif btn.action == "edit_sw_change_integrator" then
+                    config_purpose = "edit_sw_integrator"
+                    monitor_mode = "pick_integrator"
+                    render_monitor()
+
+                elseif btn.action == "edit_sw_toggle_parking" then
+                    local sw = station_config.switches[editing_switch_idx]
+                    if sw then
+                        sw.parking = not sw.parking
+                        if not sw.parking then
+                            sw.bay_detector_periph = nil
+                            sw.bay_detector_face = nil
+                            sw.bay_rail_periph = nil
+                            sw.bay_rail_face = nil
+                            sw.bay_has_train = false
+                            bay_states[editing_switch_idx] = nil
+                        else
+                            bay_states[editing_switch_idx] = {
+                                last_signal = false,
+                                last_toggle_time = 0,
+                                has_train = sw.bay_has_train or false,
+                            }
+                        end
+                        save_config()
+                    end
+                    render_monitor()
+
+                elseif btn.action == "edit_sw_change_bay_det" then
+                    config_purpose = "edit_sw_bay_detector"
+                    monitor_mode = "pick_integrator"
+                    render_monitor()
+
+                elseif btn.action == "edit_sw_change_bay_rail" then
+                    config_purpose = "edit_sw_bay_rail"
+                    monitor_mode = "pick_integrator"
                     render_monitor()
 
                 elseif btn.action == "cancel_departure" then
