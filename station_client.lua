@@ -477,6 +477,10 @@ local has_train = false   -- detected by detector rail integrator
 local pending_destination = nil   -- {id, label} destination user selected
 local pending_outbound = nil      -- hub only: {station_id, label} station requesting a train
 local departure_countdown = nil   -- seconds remaining in countdown, nil if inactive
+local switches_locked = false     -- hub: true while train is in transit (switches held in bypass)
+local switches_locked_for = nil   -- hub: destination station id we're waiting on
+local switches_locked_time = 0    -- os.clock() when locked (for safety timeout)
+local SWITCH_LOCK_TIMEOUT = 120   -- max seconds to hold switches locked
 
 -- Per-bay state tracking for parking bays
 -- Keyed by switch index: {last_signal, last_toggle_time, has_train}
@@ -578,6 +582,10 @@ end
 local function auto_park()
     if not station_config.is_hub then return end
     if not has_train then return end
+    if switches_locked then
+        print("[auto-park] Switches locked (train in transit), skipping")
+        return
+    end
 
     local empty_bay = nil
     for i, sw in ipairs(station_config.switches) do
@@ -1746,6 +1754,12 @@ local function command_listener()
                     }
                     print("Station auto-registered: " .. (msg.label or "#" .. sender))
                 end
+                -- Unlock switches if destination station reports train arrived
+                if switches_locked and switches_locked_for == sender and msg.has_train == true then
+                    switches_locked = false
+                    switches_locked_for = nil
+                    print("[hub] Train arrived at #" .. sender .. " - switches unlocked")
+                end
                 -- Send heartbeat response so remote knows hub is alive
                 rednet.send(sender, {
                     status = "heartbeat_ack",
@@ -1860,7 +1874,7 @@ end
 
 local function discovery_loop()
     if station_config.is_hub then
-        -- Hub: check for offline stations
+        -- Hub: check for offline stations + switch lock timeout
         while true do
             sleep(10)
             local now = os.clock()
@@ -1869,6 +1883,12 @@ local function discovery_loop()
                     st.online = false
                     print("Station offline: " .. (st.label or "#" .. id))
                 end
+            end
+            -- Safety: unlock switches if timeout exceeded
+            if switches_locked and (now - switches_locked_time) > SWITCH_LOCK_TIMEOUT then
+                print("[hub] Switch lock timeout (" .. SWITCH_LOCK_TIMEOUT .. "s) - unlocking")
+                switches_locked = false
+                switches_locked_for = nil
             end
         end
     else
@@ -1918,6 +1938,19 @@ local function train_arrival_handler()
             local target = pending_outbound
             pending_outbound = nil
             print("[hub] Train ready, sending to " .. (target.label or "#" .. target.station_id))
+
+            -- Set ALL parking switches to bypass (ON) so train goes past bays to exit
+            for i, sw in ipairs(station_config.switches) do
+                if sw.parking then
+                    set_switch(i, true)
+                end
+            end
+            -- Lock switches until destination confirms arrival
+            switches_locked = true
+            switches_locked_for = target.station_id
+            switches_locked_time = os.clock()
+            print("[hub] Switches locked for transit to " .. (target.label or "#" .. target.station_id))
+
             os.sleep(1)
             if has_train then
                 dispatch()
@@ -2006,7 +2039,19 @@ local function departure_handler()
 
         if not cancelled and has_train and pending_destination then
             local dest = pending_destination
-            -- Notify hub about outbound dispatch
+            -- Hub: set switches to bypass parking bays and lock them
+            if station_config.is_hub then
+                for i, sw in ipairs(station_config.switches) do
+                    if sw.parking then
+                        set_switch(i, true)
+                    end
+                end
+                switches_locked = true
+                switches_locked_for = dest.id
+                switches_locked_time = os.clock()
+                print("[hub] Switches locked for transit to " .. dest.label)
+            end
+            -- Notify hub about outbound dispatch (remote stations)
             if HUB_ID and HUB_ID ~= os.getComputerID() then
                 rednet.send(HUB_ID, {
                     action = "request_dispatch",
@@ -2511,6 +2556,15 @@ local function terminal_input()
                     print("  e.g. connect 5")
                 end
 
+            elseif cmd == "unlock" then
+                if switches_locked then
+                    switches_locked = false
+                    switches_locked_for = nil
+                    print("Switches unlocked")
+                else
+                    print("Switches not locked")
+                end
+
             elseif cmd == "test" then
                 -- Raw modem transmit test
                 print("Testing modem transmit...")
@@ -2544,6 +2598,7 @@ local function terminal_input()
                 print("  setup        - run full setup wizard")
                 print("  status       - show current status")
                 print("  connect <id> - connect to hub by ID")
+                print("  unlock       - force unlock switches")
                 print("  pos <x y z>  - set station position")
                 print("  test         - test modem/GPS")
                 print("  rescan       - rescan peripherals")
