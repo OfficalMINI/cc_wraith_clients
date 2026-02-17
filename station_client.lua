@@ -2216,7 +2216,7 @@ end
 
 local function terminal_input()
     print("")
-    print("Commands: name, hub, remote, pos, setup, status, help")
+    print("Commands: name, hub, remote, connect, pos, test, status, help")
     print("")
     while true do
         write("> ")
@@ -2284,6 +2284,53 @@ local function terminal_input()
                     print("Usage: pos <x> <y> <z>")
                 end
 
+            elseif cmd == "connect" then
+                local target_id = tonumber(parts[2])
+                if target_id then
+                    print("Trying to reach #" .. target_id .. "...")
+                    HUB_ID = target_id
+                    -- Test with a ping
+                    rednet.send(target_id, {
+                        type = "station_ping",
+                        label = station_config.label,
+                        id = os.getComputerID(),
+                    }, PROTOCOLS.ping)
+                    local sender, msg = rednet.receive(PROTOCOLS.status, 5)
+                    if sender == target_id then
+                        print("Hub #" .. target_id .. " responded!")
+                        if type(msg) == "table" and msg.stations then
+                            route_data = msg.stations
+                        end
+                        register_with_hub()
+                    else
+                        print("No response from #" .. target_id)
+                        HUB_ID = nil
+                    end
+                else
+                    print("Usage: connect <computer_id>")
+                    print("  e.g. connect 5")
+                end
+
+            elseif cmd == "test" then
+                -- Raw modem transmit test
+                print("Testing modem transmit...")
+                local m = peripheral.wrap(modem_side)
+                if m then
+                    print("  isOpen(65535): " .. tostring(m.isOpen(65535)))
+                    print("  isOpen(" .. os.getComputerID() .. "): " .. tostring(m.isOpen(os.getComputerID())))
+                    print("  isWireless: " .. tostring(m.isWireless()))
+                    -- Try GPS
+                    print("  GPS test (5s timeout)...")
+                    local x, y, z = gps.locate(5)
+                    if x then
+                        print("  GPS: " .. x .. ", " .. y .. ", " .. z)
+                    else
+                        print("  GPS: FAILED (no response)")
+                    end
+                else
+                    print("  Modem not found on " .. modem_side)
+                end
+
             elseif cmd == "rescan" then
                 scan_integrators()
                 scan_player_detectors()
@@ -2296,7 +2343,9 @@ local function terminal_input()
                 print("  remote       - set as remote station")
                 print("  setup        - run full setup wizard")
                 print("  status       - show current status")
+                print("  connect <id> - connect to hub by ID")
                 print("  pos <x y z>  - set station position")
+                print("  test         - test modem/GPS")
                 print("  rescan       - rescan peripherals")
                 print("  help         - show this help")
 
