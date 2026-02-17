@@ -43,7 +43,7 @@ local HEARTBEAT_INTERVAL = 5
 local DISCOVERY_INTERVAL = 10
 local DISCOVERY_TIMEOUT = 3
 local DISPATCH_PULSE = 1.5       -- seconds to power rail for dispatch
-local DETECTOR_POLL = 0.25       -- poll detector integrator every N seconds
+local DETECTOR_FALLBACK_POLL = 0.1 -- poll interval (~2 game ticks, fastest practical)
 
 -- ========================================
 -- Config Persistence
@@ -348,29 +348,61 @@ brake_on()
 -- Detector Rail Monitoring (via integrator)
 -- ========================================
 -- Detector rails output redstone when a minecart sits on them.
--- We poll the integrator's getInput() since network peripherals
--- don't trigger os.pullEvent("redstone").
+-- AP redstone integrators fire "redstoneIntegrator" events (0.8+)
+-- when input changes: event, side, peripheral_name.
+-- Slow fallback poll for older AP versions.
+
+local detector_errors = 0
 
 local function check_detector()
+    if not station_config.detector_periph then
+        if detector_errors == 0 then
+            print("[detector] NOT CONFIGURED - run setup")
+            detector_errors = 1
+        end
+        return false
+    end
+
     local ri = get_integrator(station_config.detector_periph)
-    if not ri then return end
+    if not ri then
+        if detector_errors == 0 then
+            print("[detector] Integrator not found: " .. station_config.detector_periph)
+            detector_errors = 1
+        end
+        return false
+    end
 
     local ok, signal = pcall(ri.getInput, station_config.detector_face)
-    if not ok then return end
+    if not ok then
+        if detector_errors == 0 then
+            print("[detector] getInput failed: " .. tostring(signal))
+            detector_errors = 1
+        end
+        return false
+    end
+
+    detector_errors = 0  -- reset on successful read
 
     if signal and not has_train then
         has_train = true
-        print(string.format("Train ARRIVED (%s:%s)",
+        print(string.format("[detector] Train ARRIVED (%s:%s)",
             station_config.detector_periph, station_config.detector_face))
     elseif not signal and has_train then
         has_train = false
-        print(string.format("Train DEPARTED (%s:%s)",
+        print(string.format("[detector] Train DEPARTED (%s:%s)",
             station_config.detector_periph, station_config.detector_face))
     end
+    return true
 end
 
--- Initial check
-check_detector()
+-- Initial check with status report
+print("[detector] Config: " .. tostring(station_config.detector_periph) .. ":" .. tostring(station_config.detector_face))
+local det_ok = check_detector()
+if det_ok then
+    print("[detector] Active - reading signal OK")
+else
+    print("[detector] INACTIVE - see error above")
+end
 
 -- ========================================
 -- Track Switch Control (via integrator)
@@ -1153,12 +1185,39 @@ local function monitor_touch_loop()
 end
 
 local function detector_loop()
-    -- Poll detector integrator for train arrivals.
-    -- Network peripherals don't fire local redstone events,
-    -- so we poll on a timer.
+    -- Event-driven: listen for AP "redstoneIntegrator" events (instant).
+    -- Fallback: poll every 0.5s for AP <0.8 where events don't exist.
+    print("[detector] Loop started (poll=" .. DETECTOR_FALLBACK_POLL .. "s)")
+    local poll_timer = os.startTimer(DETECTOR_FALLBACK_POLL)
+    local poll_count = 0
+
     while true do
-        check_detector()
-        os.sleep(DETECTOR_POLL)
+        local event, p1, p2 = os.pullEvent()
+
+        if event == "redstoneIntegrator" then
+            -- p1 = side, p2 = peripheral name
+            print("[detector] EVENT: " .. tostring(p1) .. " from " .. tostring(p2))
+            if p2 == station_config.detector_periph then
+                check_detector()
+            end
+        elseif event == "redstone" then
+            -- Vanilla redstone event (fires if integrator is local)
+            check_detector()
+        elseif event == "timer" and p1 == poll_timer then
+            -- Fallback poll
+            check_detector()
+            poll_count = poll_count + 1
+            -- Print periodic proof-of-life every 100 polls (~10s)
+            if poll_count % 100 == 0 then
+                local ri = get_integrator(station_config.detector_periph)
+                if ri then
+                    local ok, sig = pcall(ri.getInput, station_config.detector_face)
+                    print(string.format("[detector] poll #%d signal=%s",
+                        poll_count, ok and tostring(sig) or "ERR"))
+                end
+            end
+            poll_timer = os.startTimer(DETECTOR_FALLBACK_POLL)
+        end
     end
 end
 
