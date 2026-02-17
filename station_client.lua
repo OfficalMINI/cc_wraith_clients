@@ -2163,7 +2163,7 @@ end
 
 local function terminal_input()
     print("")
-    print("Commands: name, hub, remote, setup, status, help")
+    print("Commands: name, hub, remote, pos, setup, status, help")
     print("")
     while true do
         write("> ")
@@ -2215,6 +2215,20 @@ local function terminal_input()
                 print("Integrs:  " .. #redstone_integrators)
                 print("Switches: " .. #station_config.switches)
 
+            elseif cmd == "pos" then
+                if parts[2] and parts[3] and parts[4] then
+                    local x, y, z = tonumber(parts[2]), tonumber(parts[3]), tonumber(parts[4])
+                    if x and y and z then
+                        my_x, my_y, my_z = math.floor(x), math.floor(y), math.floor(z)
+                        print("Position set: " .. my_x .. ", " .. my_y .. ", " .. my_z)
+                    else
+                        print("Invalid coords. Usage: pos <x> <y> <z>")
+                    end
+                else
+                    print("Current: " .. my_x .. ", " .. my_y .. ", " .. my_z)
+                    print("Usage: pos <x> <y> <z>")
+                end
+
             elseif cmd == "rescan" then
                 scan_integrators()
                 scan_player_detectors()
@@ -2227,6 +2241,7 @@ local function terminal_input()
                 print("  remote       - set as remote station")
                 print("  setup        - run full setup wizard")
                 print("  status       - show current status")
+                print("  pos <x y z>  - set station position")
                 print("  rescan       - rescan peripherals")
                 print("  help         - show this help")
 
