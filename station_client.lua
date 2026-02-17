@@ -353,6 +353,7 @@ brake_on()
 -- Slow fallback poll for older AP versions.
 
 local detector_debug = true  -- verbose logging for every read
+local last_signal = false    -- previous detector reading (for edge detection)
 
 local function check_detector()
     if not station_config.detector_periph then
@@ -368,8 +369,6 @@ local function check_detector()
 
     -- Read boolean input
     local ok, signal = pcall(ri.getInput, station_config.detector_face)
-    -- Also read analog for extra info
-    local ok2, analog = pcall(ri.getAnalogInput, station_config.detector_face)
 
     if not ok then
         print("[det] getInput ERROR: " .. tostring(signal))
@@ -388,16 +387,19 @@ local function check_detector()
                 table.insert(parts, f .. "=" .. tostring(fana or 0))
             end
         end
-        print("[det] " .. table.concat(parts, " "))
+        print("[det] " .. table.concat(parts, " ") .. " train=" .. tostring(has_train))
     end
 
-    if signal and not has_train then
-        has_train = true
-        print("[det] >>> TRAIN ARRIVED <<<")
-    elseif not signal and has_train then
-        has_train = false
-        print("[det] >>> TRAIN DEPARTED <<<")
+    -- Toggle on rising edge: each time signal goes false->true, flip has_train
+    if signal and not last_signal then
+        has_train = not has_train
+        if has_train then
+            print("[det] >>> TRAIN ARRIVED <<<")
+        else
+            print("[det] >>> TRAIN DEPARTED <<<")
+        end
     end
+    last_signal = signal
     return true
 end
 
