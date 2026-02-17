@@ -1573,10 +1573,6 @@ local function command_listener()
     while true do
         local sender, msg, proto = rednet.receive(nil, 1)
 
-        if sender then
-            print("[net] from #" .. sender .. " proto=" .. tostring(proto))
-        end
-
         if sender and type(msg) == "table" then
 
             -- Hub: handle pings from remote stations
