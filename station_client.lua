@@ -402,17 +402,34 @@ end
 -- ========================================
 local route_data = nil   -- received from Wraith
 
-local function render_monitor()
+-- Monitor UI state
+local monitor_mode = "main"  -- "main", "config", "pick_integrator", "pick_face"
+local config_purpose = nil   -- "rail" or "detector" (what we're currently configuring)
+local monitor_buttons = {}   -- rebuilt each render: {{y1, y2, action, data}, ...}
+
+local function mon_btn(y1, y2, action, data)
+    table.insert(monitor_buttons, {y1 = y1, y2 = y2 or y1, action = action, data = data})
+end
+
+local function render_main_monitor()
     if not monitor then return end
 
     local mw, mh = monitor.getSize()
     monitor.setBackgroundColor(colors.black)
     monitor.clear()
 
-    -- Title
+    -- Title + SETUP button
     monitor.setCursorPos(1, 1)
     monitor.setTextColor(colors.cyan)
     monitor.write(station_config.label)
+    -- SETUP button top-right
+    local setup_lbl = "[SETUP]"
+    monitor.setCursorPos(mw - #setup_lbl + 1, 1)
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(colors.white)
+    monitor.write(setup_lbl)
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(1, 1, "open_config", {x1 = mw - #setup_lbl + 1, x2 = mw})
 
     -- Status
     monitor.setCursorPos(1, 2)
@@ -452,7 +469,6 @@ local function render_monitor()
     monitor.write("DESTINATIONS:")
 
     local btn_y = 7
-    local dest_buttons = {}
 
     if route_data and route_data.stations then
         for id, st in pairs(route_data.stations) do
@@ -472,7 +488,7 @@ local function render_monitor()
                 monitor.write(btn_text)
                 monitor.setBackgroundColor(colors.black)
 
-                table.insert(dest_buttons, {y = btn_y, id = id, label = lbl})
+                mon_btn(btn_y, btn_y, "dispatch_to", {id = id, label = lbl})
                 btn_y = btn_y + 2
             end
         end
@@ -498,24 +514,253 @@ local function render_monitor()
             end
         end
     end
+end
 
-    return dest_buttons
+local function render_config_monitor()
+    if not monitor then return end
+
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    -- Back button
+    monitor.setCursorPos(1, 1)
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(colors.white)
+    monitor.write("< BACK")
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(1, 1, "close_config", {x1 = 1, x2 = 6})
+
+    -- Title
+    monitor.setCursorPos(1, 2)
+    monitor.setTextColor(colors.cyan)
+    monitor.write("STATION SETUP")
+
+    -- Separator
+    monitor.setCursorPos(1, 3)
+    monitor.setTextColor(colors.gray)
+    monitor.write(string.rep("-", mw))
+
+    local cy = 4
+
+    -- Rail integrator
+    monitor.setCursorPos(1, cy)
+    monitor.setTextColor(colors.white)
+    monitor.write("Powered Rail:")
+    cy = cy + 1
+    monitor.setCursorPos(2, cy)
+    monitor.setTextColor(colors.yellow)
+    local rail_name = station_config.rail_periph or "NOT SET"
+    local rail_lbl = rail_name:sub(1, mw - 10) .. ":" .. (station_config.rail_face or "?")
+    monitor.write(rail_lbl)
+    monitor.setCursorPos(mw - 7, cy)
+    monitor.setBackgroundColor(colors.blue)
+    monitor.setTextColor(colors.white)
+    monitor.write("[CHANGE]")
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(cy, cy, "pick_rail", {x1 = mw - 7, x2 = mw})
+    cy = cy + 1
+
+    -- Detector integrator
+    cy = cy + 1
+    monitor.setCursorPos(1, cy)
+    monitor.setTextColor(colors.white)
+    monitor.write("Detector Rail:")
+    cy = cy + 1
+    monitor.setCursorPos(2, cy)
+    monitor.setTextColor(colors.yellow)
+    local det_name = station_config.detector_periph or "NOT SET"
+    local det_lbl = det_name:sub(1, mw - 10) .. ":" .. (station_config.detector_face or "?")
+    monitor.write(det_lbl)
+    monitor.setCursorPos(mw - 7, cy)
+    monitor.setBackgroundColor(colors.blue)
+    monitor.setTextColor(colors.white)
+    monitor.write("[CHANGE]")
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(cy, cy, "pick_detector", {x1 = mw - 7, x2 = mw})
+    cy = cy + 1
+
+    -- Switches summary
+    cy = cy + 1
+    monitor.setCursorPos(1, cy)
+    monitor.setTextColor(colors.gray)
+    monitor.write(string.format("Switches: %d configured", #station_config.switches))
+    cy = cy + 1
+
+    -- Integrators summary
+    cy = cy + 1
+    monitor.setCursorPos(1, cy)
+    monitor.setTextColor(colors.gray)
+    monitor.write(string.format("Integrators found: %d", #redstone_integrators))
+    cy = cy + 1
+
+    -- Rescan button
+    cy = cy + 1
+    if cy <= mh then
+        monitor.setCursorPos(2, cy)
+        monitor.setBackgroundColor(colors.gray)
+        monitor.setTextColor(colors.white)
+        local rescan_lbl = " RESCAN PERIPHERALS "
+        monitor.write(rescan_lbl)
+        monitor.setBackgroundColor(colors.black)
+        mon_btn(cy, cy, "rescan", {x1 = 2, x2 = 2 + #rescan_lbl - 1})
+    end
+end
+
+local function render_integrator_picker()
+    if not monitor then return end
+
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    -- Back button
+    monitor.setCursorPos(1, 1)
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(colors.white)
+    monitor.write("< BACK")
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(1, 1, "back_to_config", {x1 = 1, x2 = 6})
+
+    -- Title
+    local purpose_lbl = config_purpose == "rail" and "POWERED RAIL" or "DETECTOR RAIL"
+    monitor.setCursorPos(1, 2)
+    monitor.setTextColor(colors.cyan)
+    monitor.write("SELECT FOR: " .. purpose_lbl)
+
+    monitor.setCursorPos(1, 3)
+    monitor.setTextColor(colors.gray)
+    monitor.write(string.rep("-", mw))
+
+    -- List integrators
+    local cy = 4
+    if #redstone_integrators == 0 then
+        monitor.setCursorPos(2, cy)
+        monitor.setTextColor(colors.red)
+        monitor.write("No integrators found!")
+    else
+        for i, ri in ipairs(redstone_integrators) do
+            if cy > mh then break end
+            local is_current = false
+            if config_purpose == "rail" and ri.name == station_config.rail_periph then
+                is_current = true
+            elseif config_purpose == "detector" and ri.name == station_config.detector_periph then
+                is_current = true
+            end
+
+            monitor.setCursorPos(1, cy)
+            if is_current then
+                monitor.setBackgroundColor(colors.blue)
+                monitor.setTextColor(colors.white)
+            else
+                monitor.setBackgroundColor(colors.gray)
+                monitor.setTextColor(colors.white)
+            end
+            local entry = string.format(" %d. %s %s",
+                i, ri.name:sub(1, mw - 8), is_current and "*" or " ")
+            monitor.write(entry .. string.rep(" ", math.max(0, mw - #entry)))
+            monitor.setBackgroundColor(colors.black)
+            mon_btn(cy, cy, "select_integrator", {name = ri.name})
+            cy = cy + 1
+        end
+    end
+end
+
+local function render_face_picker()
+    if not monitor then return end
+
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    -- Back button
+    monitor.setCursorPos(1, 1)
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(colors.white)
+    monitor.write("< BACK")
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(1, 1, "back_to_config", {x1 = 1, x2 = 6})
+
+    -- Title
+    local purpose_lbl = config_purpose == "rail" and "POWERED RAIL" or "DETECTOR RAIL"
+    monitor.setCursorPos(1, 2)
+    monitor.setTextColor(colors.cyan)
+    monitor.write("SELECT FACE: " .. purpose_lbl)
+
+    monitor.setCursorPos(1, 3)
+    monitor.setTextColor(colors.gray)
+    monitor.write(string.rep("-", mw))
+
+    local current_face
+    if config_purpose == "rail" then
+        current_face = station_config.rail_face
+    else
+        current_face = station_config.detector_face
+    end
+
+    local cy = 4
+    for i, face in ipairs(FACES) do
+        if cy > mh then break end
+        local is_current = (face == current_face)
+
+        monitor.setCursorPos(1, cy)
+        if is_current then
+            monitor.setBackgroundColor(colors.blue)
+            monitor.setTextColor(colors.white)
+        else
+            monitor.setBackgroundColor(colors.gray)
+            monitor.setTextColor(colors.white)
+        end
+        local entry = string.format(" %d. %s %s", i, face, is_current and "*" or " ")
+        monitor.write(entry .. string.rep(" ", math.max(0, mw - #entry)))
+        monitor.setBackgroundColor(colors.black)
+        mon_btn(cy, cy, "select_face", {face = face})
+        cy = cy + 1
+    end
+end
+
+local function render_monitor()
+    if not monitor then return end
+    monitor_buttons = {}
+
+    if monitor_mode == "config" then
+        render_config_monitor()
+    elseif monitor_mode == "pick_integrator" then
+        render_integrator_picker()
+    elseif monitor_mode == "pick_face" then
+        render_face_picker()
+    else
+        render_main_monitor()
+    end
 end
 
 -- ========================================
 -- Update Check (GitHub HTTP)
 -- ========================================
 local function check_for_updates()
-    print("[update] Checking github...")
-    local ok, resp = pcall(http.get, UPDATE_URL)
-    if not ok or not resp then
-        print("[update] Fetch failed")
+    if not http then
+        print("[update] HTTP API not available")
         return false
     end
+    print("[update] Checking github...")
+    local ok, resp, err = pcall(http.get, UPDATE_URL)
+    if not ok then
+        print("[update] Error: " .. tostring(resp))
+        return false
+    end
+    if not resp then
+        print("[update] Failed: " .. tostring(err))
+        return false
+    end
+    local code = resp.getResponseCode()
     local content = resp.readAll()
     resp.close()
+    if code ~= 200 then
+        print("[update] HTTP " .. tostring(code))
+        return false
+    end
     if not content or #content < 100 then
-        print("[update] Bad response (" .. (content and #content or 0) .. "b)")
+        print("[update] Bad response (" .. #content .. "b)")
         return false
     end
     local sum = 0
@@ -655,8 +900,6 @@ print("")
 -- ========================================
 -- Main Loops
 -- ========================================
-
-local dest_buttons = {}
 
 local function command_listener()
     while true do
@@ -807,7 +1050,7 @@ end
 
 local function monitor_loop()
     while true do
-        dest_buttons = render_monitor() or {}
+        render_monitor()
         os.sleep(1)
     end
 end
@@ -818,18 +1061,92 @@ local function monitor_touch_loop()
     end
     while true do
         local ev, side, tx, ty = os.pullEvent("monitor_touch")
-        for _, btn in ipairs(dest_buttons) do
-            if ty == btn.y and has_train then
-                print("Destination selected: " .. btn.label)
-                if WRAITH_ID then
-                    rednet.send(WRAITH_ID, {
-                        action = "request_dispatch",
-                        from = os.getComputerID(),
-                        to = btn.id,
-                    }, PROTOCOLS.status)
+
+        -- Find which button was tapped
+        for _, btn in ipairs(monitor_buttons) do
+            if ty >= btn.y1 and ty <= btn.y2 then
+                -- Some buttons also check x range
+                if btn.data and btn.data.x1 then
+                    if tx < btn.data.x1 or tx > btn.data.x2 then
+                        -- Outside x range, skip
+                        goto continue
+                    end
                 end
-                dispatch()
+
+                -- Handle action
+                if btn.action == "open_config" then
+                    monitor_mode = "config"
+                    render_monitor()
+
+                elseif btn.action == "close_config" then
+                    monitor_mode = "main"
+                    render_monitor()
+
+                elseif btn.action == "back_to_config" then
+                    monitor_mode = "config"
+                    config_purpose = nil
+                    render_monitor()
+
+                elseif btn.action == "dispatch_to" then
+                    if has_train then
+                        print("Destination selected: " .. btn.data.label)
+                        if WRAITH_ID then
+                            rednet.send(WRAITH_ID, {
+                                action = "request_dispatch",
+                                from = os.getComputerID(),
+                                to = btn.data.id,
+                            }, PROTOCOLS.status)
+                        end
+                        dispatch()
+                        render_monitor()
+                    end
+
+                elseif btn.action == "pick_rail" then
+                    config_purpose = "rail"
+                    monitor_mode = "pick_integrator"
+                    render_monitor()
+
+                elseif btn.action == "pick_detector" then
+                    config_purpose = "detector"
+                    monitor_mode = "pick_integrator"
+                    render_monitor()
+
+                elseif btn.action == "select_integrator" then
+                    if config_purpose == "rail" then
+                        station_config.rail_periph = btn.data.name
+                    elseif config_purpose == "detector" then
+                        station_config.detector_periph = btn.data.name
+                    end
+                    save_config()
+                    -- Now pick face
+                    monitor_mode = "pick_face"
+                    render_monitor()
+
+                elseif btn.action == "select_face" then
+                    if config_purpose == "rail" then
+                        station_config.rail_face = btn.data.face
+                        brake_on()  -- re-apply brake with new config
+                    elseif config_purpose == "detector" then
+                        station_config.detector_face = btn.data.face
+                    end
+                    save_config()
+                    print(string.format("Config updated: %s -> %s:%s",
+                        config_purpose,
+                        config_purpose == "rail" and station_config.rail_periph or station_config.detector_periph,
+                        btn.data.face))
+                    -- Return to config menu
+                    monitor_mode = "config"
+                    config_purpose = nil
+                    render_monitor()
+
+                elseif btn.action == "rescan" then
+                    scan_integrators()
+                    print("Rescanned: " .. #redstone_integrators .. " integrators found")
+                    render_monitor()
+                end
+
                 break
+                ::continue::
             end
         end
     end

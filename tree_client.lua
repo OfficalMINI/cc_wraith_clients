@@ -395,16 +395,29 @@ end
 -- Fetches latest script from Pastebin, compares hash with local VERSION.
 -- If different, overwrites self and reboots. Needs internet via wired modem.
 local function check_pastebin_update()
-    print("[update] Checking github...")
-    local ok, resp = pcall(http.get, UPDATE_URL)
-    if not ok or not resp then
-        print("[update] Fetch failed")
+    if not http then
+        print("[update] HTTP API not available")
         return false
     end
+    print("[update] Checking github...")
+    local ok, resp, err = pcall(http.get, UPDATE_URL)
+    if not ok then
+        print("[update] Error: " .. tostring(resp))
+        return false
+    end
+    if not resp then
+        print("[update] Failed: " .. tostring(err))
+        return false
+    end
+    local code = resp.getResponseCode()
     local content = resp.readAll()
     resp.close()
+    if code ~= 200 then
+        print("[update] HTTP " .. tostring(code))
+        return false
+    end
     if not content or #content < 100 then
-        print("[update] Bad response (" .. (content and #content or 0) .. "b)")
+        print("[update] Bad response (" .. #content .. "b)")
         return false
     end
     -- Compare hash
