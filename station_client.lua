@@ -1583,7 +1583,24 @@ local function command_listener()
                     if msg.has_train ~= nil then st.has_train = msg.has_train end
                     if msg.players_nearby ~= nil then st.players_nearby = msg.players_nearby end
                     if msg.label then st.label = msg.label end
+                else
+                    -- Unknown station sent heartbeat — auto-register it
+                    connected_stations[sender] = {
+                        id = sender,
+                        label = msg.label or ("Station #" .. sender),
+                        x = msg.x or 0, y = msg.y or 0, z = msg.z or 0,
+                        has_train = msg.has_train or false,
+                        switches = {},
+                        online = true,
+                        last_seen = os.clock(),
+                    }
+                    print("Station auto-registered: " .. (msg.label or "#" .. sender))
                 end
+                -- Send heartbeat response so remote knows hub is alive
+                rednet.send(sender, {
+                    status = "heartbeat_ack",
+                    stations = get_station_list(),
+                }, PROTOCOLS.status)
 
             -- Remote: handle status updates from hub
             elseif not station_config.is_hub and proto == PROTOCOLS.status then
