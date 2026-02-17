@@ -128,23 +128,25 @@ local function find_wireless_modem()
     return nil
 end
 
+-- List all modems for diagnostics
+print("Modems attached:")
+for _, side in ipairs({"back", "top", "left", "right", "bottom", "front"}) do
+    if peripheral.getType(side) == "modem" then
+        local m = peripheral.wrap(side)
+        local wireless = m and m.isWireless and m.isWireless()
+        local already_open = rednet.isOpen(side)
+        print("  " .. side .. ": " .. (wireless and "WIRELESS" or "wired") .. (already_open and " [already open]" or ""))
+    end
+end
+
 local modem_side = find_wireless_modem()
 if not modem_side then
     printError("No wireless/ender modem found!")
     printError("Attach an ender modem directly to this computer.")
-    printError("(Wired modems are for peripherals only)")
-    -- List what modems ARE attached for debugging
-    for _, side in ipairs({"back", "top", "left", "right", "bottom", "front"}) do
-        if peripheral.getType(side) == "modem" then
-            local m = peripheral.wrap(side)
-            local wireless = m and m.isWireless and m.isWireless()
-            print("  Found modem on " .. side .. " (wireless=" .. tostring(wireless) .. ")")
-        end
-    end
     return
 end
-print("Wireless modem: " .. modem_side)
 rednet.open(modem_side)
+print("Rednet opened on: " .. modem_side .. " (wireless)")
 
 -- ========================================
 -- GPS Position
