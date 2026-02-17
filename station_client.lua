@@ -1,16 +1,17 @@
 -- =============================================
--- WRAITH OS - STATION CLIENT
+-- STATION CLIENT (Hub / Remote)
 -- =============================================
 -- Run on wireless modem PCs at each train station.
 -- All redstone I/O (powered rail, detector rail, switches)
 -- uses Advanced Peripherals redstone integrators
 -- connected via wired modem.
 --
+-- One station is configured as "hub" and manages all others.
+-- Remote stations discover and register with the hub via rednet.
+--
 -- Setup: Place computer at station with wireless + wired modem.
 --        Connect redstone integrators via wired modem network.
 --        Attach monitor for route map display.
---        Configure rail integrator + face for powered rail output.
---        Configure detector integrator + face for detector rail input.
 --        Run: station_client
 
 local CLIENT_TYPE = "station_client"
@@ -30,7 +31,6 @@ local function compute_version()
 end
 local VERSION = compute_version()
 local UPDATE_URL = "https://raw.githubusercontent.com/OfficalMINI/cc_wraith_clients/refs/heads/main/station_client.lua"
-local WRAITH_ID = nil
 
 local PROTOCOLS = {
     ping      = "wraith_rail_st_ping",
@@ -44,6 +44,9 @@ local DISCOVERY_INTERVAL = 10
 local DISCOVERY_TIMEOUT = 3
 local DISPATCH_PULSE = 1.5       -- seconds to power rail for dispatch
 local DETECTOR_FALLBACK_POLL = 0.1 -- poll interval (~2 game ticks, fastest practical)
+local AUTO_PARK_DELAY = 5        -- seconds after arrival before auto-parking
+local PLAYER_DETECT_RANGE = 16   -- blocks range for player detector
+local PLAYER_CHECK_INTERVAL = 2  -- seconds between player proximity checks
 
 -- ========================================
 -- Config Persistence
@@ -52,12 +55,13 @@ local CONFIG_FILE = "station_config.lua"
 
 local station_config = {
     label = nil,               -- station name
+    is_hub = false,            -- true if this is the hub station
     rail_periph = nil,         -- peripheral name of redstone integrator for powered rail
     rail_face = "top",          -- face on the integrator for powered rail output
     detector_periph = nil,     -- peripheral name of redstone integrator for detector rail
     detector_face = "top",      -- face on the integrator for detector rail input
-    switches = {},             -- {{peripheral_name, face, description, routes}, ...}
-    storage_bays = {},         -- {{switch_idx, description}, ...}
+    switches = {},             -- {{peripheral_name, face, description, routes, parking, bay_*}, ...}
+    player_detector = nil,     -- peripheral name of player detector block
     rules = {},                -- automation rules
 }
 
@@ -94,6 +98,18 @@ load_config()
 if not station_config.label then
     station_config.label = "Station " .. os.getComputerID()
     save_config()
+end
+
+-- ========================================
+-- Hub State (only used if is_hub)
+-- ========================================
+-- Connected remote stations, keyed by computer ID
+local connected_stations = {}
+-- Hub ID: known hub computer ID (self if hub, discovered if remote)
+local HUB_ID = nil
+
+if station_config.is_hub then
+    HUB_ID = os.getComputerID()
 end
 
 -- ========================================
@@ -177,12 +193,56 @@ local function get_integrator(periph_name)
     return nil
 end
 
+-- Player Detectors (Advanced Peripherals) via wired modem
+local player_detectors = {}
+local function scan_player_detectors()
+    player_detectors = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        local ptype = peripheral.getType(name)
+        if ptype == "playerDetector" then
+            table.insert(player_detectors, {
+                name = name,
+                periph = peripheral.wrap(name),
+            })
+        end
+    end
+end
+scan_player_detectors()
+if #player_detectors > 0 then
+    print("Player detectors: " .. #player_detectors)
+end
+
+-- Helper: get player detector peripheral by name
+local function get_player_detector(periph_name)
+    if not periph_name then return nil end
+    for _, pd in ipairs(player_detectors) do
+        if pd.name == periph_name then
+            return pd.periph
+        end
+    end
+    return nil
+end
+
+-- Check if any players are near this station
+local players_nearby = false
+local function check_players_nearby()
+    local pd = get_player_detector(station_config.player_detector)
+    if not pd then
+        players_nearby = false
+        return false
+    end
+    local ok, players = pcall(pd.getPlayersInRange, PLAYER_DETECT_RANGE)
+    if ok and players and #players > 0 then
+        players_nearby = true
+        return true
+    end
+    players_nearby = false
+    return false
+end
+
 -- ========================================
 -- Interactive Setup
 -- ========================================
--- Runs on first boot or when peripherals aren't configured.
--- Also accessible by running: station_client setup
-
 local FACES = {"top", "bottom", "north", "south", "east", "west"}
 
 local function pick_number(prompt, max)
@@ -252,6 +312,12 @@ local function run_setup()
         station_config.label = new_label
     end
 
+    -- Hub mode
+    print("")
+    write("Is this the HUB station? [y/N]: ")
+    local hub_ans = read()
+    station_config.is_hub = (hub_ans == "y" or hub_ans == "Y")
+
     -- Powered rail integrator
     station_config.rail_periph = pick_integrator("POWERED RAIL (output)")
     station_config.rail_face = pick_face("powered rail face", station_config.rail_face)
@@ -302,15 +368,40 @@ local function run_setup()
         end
     end
 
+    -- Player detector
+    scan_player_detectors()
+    if #player_detectors > 0 then
+        print("")
+        print("Found " .. #player_detectors .. " player detector(s):")
+        for i, pd in ipairs(player_detectors) do
+            print(string.format("  %d. %s", i, pd.name))
+        end
+        write("Use player detector? [Y/n]: ")
+        local pd_ans = read()
+        if pd_ans ~= "n" and pd_ans ~= "N" then
+            if #player_detectors == 1 then
+                station_config.player_detector = player_detectors[1].name
+            else
+                local idx = pick_number("Choice [1-" .. #player_detectors .. "]: ", #player_detectors)
+                station_config.player_detector = player_detectors[idx].name
+            end
+            print("Player detector: " .. station_config.player_detector)
+        else
+            station_config.player_detector = nil
+        end
+    end
+
     save_config()
 
     print("")
     print("========================================")
     print("  Setup complete! Config saved.")
     print("========================================")
+    print("  Mode:     " .. (station_config.is_hub and "HUB" or "REMOTE"))
     print("  Rail:     " .. station_config.rail_periph .. ":" .. station_config.rail_face)
     print("  Detector: " .. station_config.detector_periph .. ":" .. station_config.detector_face)
     print("  Switches: " .. #station_config.switches)
+    print("  Players:  " .. (station_config.player_detector or "NONE"))
     print("========================================")
     sleep(1)
 end
@@ -328,12 +419,22 @@ elseif not station_config.rail_periph or not station_config.detector_periph then
     end
 end
 
+-- Update HUB_ID after config load/setup
+if station_config.is_hub then
+    HUB_ID = os.getComputerID()
+end
+
 -- ========================================
 -- Powered Rail Control (via integrator)
 -- ========================================
 -- Default: unpowered (brake). Power briefly to dispatch.
 
 local has_train = false   -- detected by detector rail integrator
+
+-- Departure / request state
+local pending_destination = nil   -- {id, label} destination user selected
+local pending_outbound = nil      -- hub only: {station_id, label} station requesting a train
+local departure_countdown = nil   -- seconds remaining in countdown, nil if inactive
 
 -- Per-bay state tracking for parking bays
 -- Keyed by switch index: {last_signal, last_toggle_time, has_train}
@@ -404,7 +505,40 @@ local function dispatch_from_bay(sw_idx)
     if bay_states[sw_idx] then
         bay_states[sw_idx].has_train = false
     end
+    sw.bay_has_train = false
+    save_config()
     print("Bay " .. sw_idx .. " dispatch complete, rail braked")
+end
+
+-- Auto-park: find empty bay, set switches, dispatch
+local function auto_park()
+    if not station_config.is_hub then return end
+    if not has_train then return end
+
+    local empty_bay = nil
+    for i, sw in ipairs(station_config.switches) do
+        if sw.parking then
+            local bs = bay_states[i]
+            if not bs or not bs.has_train then
+                empty_bay = i
+                break
+            end
+        end
+    end
+    if not empty_bay then
+        print("[auto-park] No empty bays!")
+        return
+    end
+
+    -- Set switches: target bay switch OFF (allow into bay from hub), others ON (block)
+    for i, sw in ipairs(station_config.switches) do
+        if sw.parking then
+            set_switch(i, i ~= empty_bay)
+        end
+    end
+
+    print("[auto-park] -> Bay " .. empty_bay .. " (" .. (station_config.switches[empty_bay].description or "?") .. ")")
+    dispatch()
 end
 
 -- Start with brake on (station + all bays)
@@ -418,34 +552,18 @@ end
 -- ========================================
 -- Detector Rail Monitoring (via integrator)
 -- ========================================
--- Detector rails output redstone when a minecart sits on them.
--- AP redstone integrators fire "redstoneIntegrator" events (0.8+)
--- when input changes: event, side, peripheral_name.
--- Slow fallback poll for older AP versions.
-
 local last_signal = false    -- previous detector reading (for edge detection)
 local last_toggle_time = 0   -- debounce: time of last toggle
 local DEBOUNCE_TIME = 2      -- ignore rising edges for N seconds after a toggle
 
 local function check_detector()
-    if not station_config.detector_periph then
-        print("[det] NO PERIPH CONFIGURED")
-        return false
-    end
+    if not station_config.detector_periph then return false end
 
     local ri = get_integrator(station_config.detector_periph)
-    if not ri then
-        print("[det] PERIPH NOT FOUND: " .. station_config.detector_periph)
-        return false
-    end
+    if not ri then return false end
 
-    -- Read boolean input
     local ok, signal = pcall(ri.getInput, station_config.detector_face)
-
-    if not ok then
-        print("[det] getInput ERROR: " .. tostring(signal))
-        return false
-    end
+    if not ok then return false end
 
     -- Toggle on rising edge with debounce
     local now = os.clock()
@@ -455,11 +573,21 @@ local function check_detector()
             last_toggle_time = now
             if has_train then
                 print("[det] >>> TRAIN ARRIVED <<<")
+                os.queueEvent("train_arrived")
             else
                 print("[det] >>> TRAIN DEPARTED <<<")
+                os.queueEvent("train_departed")
             end
-        else
-            print("[det] (edge ignored - debounce)")
+            -- Notify hub immediately if remote station
+            if HUB_ID and HUB_ID ~= os.getComputerID() then
+                check_players_nearby()
+                rednet.send(HUB_ID, {
+                    id = os.getComputerID(),
+                    label = station_config.label,
+                    has_train = has_train,
+                    players_nearby = players_nearby,
+                }, PROTOCOLS.heartbeat)
+            end
         end
     end
     last_signal = signal
@@ -533,13 +661,13 @@ end
 -- ========================================
 -- Monitor Display
 -- ========================================
-local route_data = nil   -- received from Wraith
+local route_data = nil   -- station list from hub (for remote stations)
 
 -- Monitor UI state
-local monitor_mode = "main"  -- "main", "config", "pick_integrator", "pick_face", "switch_face", "switch_parking"
-local config_purpose = nil   -- "rail", "detector", or "switch"
-local pending_switch = nil   -- temp switch being built: {peripheral_name, face, parking}
-local monitor_buttons = {}   -- rebuilt each render: {{y1, y2, action, data}, ...}
+local monitor_mode = "main"  -- "main", "config", "pick_integrator", "pick_face", "switch_face", "switch_parking", "pick_player_det"
+local config_purpose = nil   -- "rail", "detector", "switch", "bay_detector", "bay_rail"
+local pending_switch = nil   -- temp switch being built
+local monitor_buttons = {}   -- rebuilt each render
 
 local function mon_btn(y1, y2, action, data)
     table.insert(monitor_buttons, {y1 = y1, y2 = y2 or y1, action = action, data = data})
@@ -555,8 +683,9 @@ local function render_main_monitor()
     -- Title + SETUP button
     monitor.setCursorPos(1, 1)
     monitor.setTextColor(colors.cyan)
-    monitor.write(station_config.label)
-    -- SETUP button top-right
+    local title = station_config.label
+    if station_config.is_hub then title = "[HUB] " .. title end
+    monitor.write(title:sub(1, mw - 8))
     local setup_lbl = "[SETUP]"
     monitor.setCursorPos(mw - #setup_lbl + 1, 1)
     monitor.setBackgroundColor(colors.gray)
@@ -565,14 +694,19 @@ local function render_main_monitor()
     monitor.setBackgroundColor(colors.black)
     mon_btn(1, 1, "open_config", {x1 = mw - #setup_lbl + 1, x2 = mw})
 
-    -- Status
+    -- Status line
     monitor.setCursorPos(1, 2)
-    if WRAITH_ID then
+    if station_config.is_hub then
+        local count = 0
+        for _ in pairs(connected_stations) do count = count + 1 end
         monitor.setTextColor(colors.lime)
-        monitor.write("Connected to Wraith")
+        monitor.write("HUB - " .. count .. " stations")
+    elseif HUB_ID then
+        monitor.setTextColor(colors.lime)
+        monitor.write("Hub: #" .. HUB_ID)
     else
-        monitor.setTextColor(colors.red)
-        monitor.write("Disconnected")
+        monitor.setTextColor(colors.orange)
+        monitor.write("Searching for hub...")
     end
 
     -- Train status
@@ -587,71 +721,248 @@ local function render_main_monitor()
         monitor.write("NONE")
     end
 
-    -- Position
-    monitor.setCursorPos(1, 4)
-    monitor.setTextColor(colors.gray)
-    monitor.write(string.format("Pos: %d, %d, %d", my_x, my_y, my_z))
+    -- Player presence indicator
+    if station_config.player_detector then
+        local player_x = mw - 10
+        if player_x > 1 then
+            monitor.setCursorPos(player_x, 3)
+            if players_nearby then
+                monitor.setTextColor(colors.yellow)
+                monitor.write(" PLAYERS")
+            else
+                monitor.setTextColor(colors.gray)
+                monitor.write("        ")
+            end
+        end
+    end
 
     -- Separator
-    monitor.setCursorPos(1, 5)
+    monitor.setCursorPos(1, 4)
     monitor.setTextColor(colors.gray)
     monitor.write(string.rep("-", mw))
 
-    -- Destination buttons
-    monitor.setCursorPos(1, 6)
-    monitor.setTextColor(colors.cyan)
-    monitor.write("DESTINATIONS:")
+    local btn_y = 5
 
-    local btn_y = 7
+    if pending_destination or (station_config.is_hub and pending_outbound) then
+        -- Departure / outbound state
+        if station_config.is_hub and pending_outbound and not pending_destination then
+            -- Hub sending train to a remote station
+            monitor.setCursorPos(1, btn_y)
+            monitor.setTextColor(colors.cyan)
+            monitor.write("SENDING TRAIN TO:")
+            btn_y = btn_y + 1
+            monitor.setCursorPos(2, btn_y)
+            monitor.setTextColor(colors.white)
+            monitor.write(pending_outbound.label)
+            btn_y = btn_y + 2
+            monitor.setCursorPos(2, btn_y)
+            monitor.setTextColor(colors.orange)
+            monitor.write("Pulling from bay...")
 
-    if route_data and route_data.stations then
-        for id, st in pairs(route_data.stations) do
-            if id ~= os.getComputerID() and btn_y <= mh then
-                local lbl = st.label or ("Station #" .. id)
-                if st.is_hub then lbl = "\4 " .. lbl end
+        elseif pending_destination and departure_countdown then
+            -- Countdown active
+            monitor.setCursorPos(1, btn_y)
+            monitor.setTextColor(colors.cyan)
+            monitor.write("DEPARTING TO:")
+            btn_y = btn_y + 1
+            monitor.setCursorPos(2, btn_y)
+            monitor.setTextColor(colors.white)
+            monitor.write(pending_destination.label)
+            btn_y = btn_y + 2
 
+            -- Big countdown display
+            local count_str = tostring(departure_countdown)
+            local display = ">>> " .. count_str .. " <<<"
+            monitor.setCursorPos(math.max(1, math.floor((mw - #display) / 2) + 1), btn_y)
+            monitor.setTextColor(colors.yellow)
+            monitor.write(display)
+            btn_y = btn_y + 2
+
+            -- Cancel button
+            local cancel_text = " CANCEL "
+            monitor.setCursorPos(math.max(1, math.floor((mw - #cancel_text) / 2) + 1), btn_y)
+            monitor.setBackgroundColor(colors.red)
+            monitor.setTextColor(colors.white)
+            monitor.write(cancel_text)
+            monitor.setBackgroundColor(colors.black)
+            mon_btn(btn_y, btn_y, "cancel_departure", {})
+
+        elseif pending_destination then
+            -- Waiting for train
+            monitor.setCursorPos(1, btn_y)
+            monitor.setTextColor(colors.cyan)
+            monitor.write("DESTINATION:")
+            btn_y = btn_y + 1
+            monitor.setCursorPos(2, btn_y)
+            monitor.setTextColor(colors.white)
+            monitor.write(pending_destination.label)
+            btn_y = btn_y + 2
+            monitor.setCursorPos(2, btn_y)
+            monitor.setTextColor(colors.orange)
+            monitor.write("Requesting train...")
+            btn_y = btn_y + 2
+
+            -- Cancel button
+            local cancel_text = " CANCEL "
+            monitor.setCursorPos(math.max(1, math.floor((mw - #cancel_text) / 2) + 1), btn_y)
+            monitor.setBackgroundColor(colors.red)
+            monitor.setTextColor(colors.white)
+            monitor.write(cancel_text)
+            monitor.setBackgroundColor(colors.black)
+            mon_btn(btn_y, btn_y, "cancel_departure", {})
+        end
+
+    elseif station_config.is_hub then
+        -- Hub overview: parking bays + connected stations + destinations
+        monitor.setCursorPos(1, btn_y)
+        monitor.setTextColor(colors.cyan)
+        monitor.write("PARKING BAYS:")
+        btn_y = btn_y + 1
+
+        local has_bays = false
+        for si, sw in ipairs(station_config.switches) do
+            if sw.parking then
+                has_bays = true
+                if btn_y > mh - 4 then break end
+                local bs = bay_states[si]
+                local parked = bs and bs.has_train
                 monitor.setCursorPos(2, btn_y)
-                if has_train then
-                    monitor.setBackgroundColor(colors.blue)
-                    monitor.setTextColor(colors.white)
+                if parked then
+                    monitor.setTextColor(colors.lime)
+                    monitor.write(string.format("%s [PARKED]", sw.description or "Bay " .. si))
                 else
-                    monitor.setBackgroundColor(colors.gray)
-                    monitor.setTextColor(colors.lightGray)
+                    monitor.setTextColor(colors.gray)
+                    monitor.write(string.format("%s [EMPTY]", sw.description or "Bay " .. si))
                 end
+                btn_y = btn_y + 1
+            end
+        end
+        if not has_bays then
+            monitor.setCursorPos(2, btn_y)
+            monitor.setTextColor(colors.gray)
+            monitor.write("No parking bays configured")
+            btn_y = btn_y + 1
+        end
+
+        -- Separator
+        btn_y = btn_y + 1
+        if btn_y <= mh then
+            monitor.setCursorPos(1, btn_y)
+            monitor.setTextColor(colors.gray)
+            monitor.write(string.rep("-", mw))
+            btn_y = btn_y + 1
+        end
+
+        -- Connected stations
+        if btn_y <= mh then
+            monitor.setCursorPos(1, btn_y)
+            monitor.setTextColor(colors.cyan)
+            monitor.write("STATIONS:")
+            btn_y = btn_y + 1
+        end
+
+        local sorted = {}
+        for id, st in pairs(connected_stations) do
+            table.insert(sorted, st)
+        end
+        table.sort(sorted, function(a, b) return (a.label or "") < (b.label or "") end)
+
+        for _, st in ipairs(sorted) do
+            if btn_y > mh then break end
+            monitor.setCursorPos(2, btn_y)
+            local online = st.online and (os.clock() - st.last_seen) < 15
+            monitor.setTextColor(online and colors.white or colors.red)
+            local tags = ""
+            if st.has_train then tags = tags .. " [TRAIN]" end
+            if st.players_nearby then tags = tags .. " [P]" end
+            monitor.write((st.label or "#" .. st.id):sub(1, mw - 16) .. tags)
+            btn_y = btn_y + 1
+        end
+
+        if #sorted == 0 and btn_y <= mh then
+            monitor.setCursorPos(2, btn_y)
+            monitor.setTextColor(colors.gray)
+            monitor.write("No stations connected")
+            btn_y = btn_y + 1
+        end
+
+        -- Separator before destinations
+        if next(connected_stations) and btn_y + 2 <= mh then
+            btn_y = btn_y + 1
+            monitor.setCursorPos(1, btn_y)
+            monitor.setTextColor(colors.gray)
+            monitor.write(string.rep("-", mw))
+            btn_y = btn_y + 1
+
+            -- Hub destination buttons
+            monitor.setCursorPos(1, btn_y)
+            monitor.setTextColor(colors.cyan)
+            monitor.write("GO TO:")
+            btn_y = btn_y + 1
+
+            for id, st in pairs(connected_stations) do
+                if btn_y + 1 > mh then break end
+                local lbl = st.label or ("Station #" .. id)
+                monitor.setCursorPos(2, btn_y)
+                monitor.setBackgroundColor(colors.blue)
+                monitor.setTextColor(colors.white)
                 local btn_text = " " .. lbl:sub(1, mw - 4) .. string.rep(" ", math.max(0, mw - 4 - #lbl))
                 monitor.write(btn_text)
                 monitor.setBackgroundColor(colors.black)
-
                 mon_btn(btn_y, btn_y, "dispatch_to", {id = id, label = lbl})
                 btn_y = btn_y + 2
             end
         end
+
     else
-        monitor.setCursorPos(2, btn_y)
-        monitor.setTextColor(colors.gray)
-        monitor.write("No route data")
+        -- Remote station: destination buttons (always clickable)
+        monitor.setCursorPos(1, btn_y)
+        monitor.setTextColor(colors.cyan)
+        monitor.write("DESTINATIONS:")
+        btn_y = btn_y + 1
+
+        if route_data then
+            for id, st in pairs(route_data) do
+                if tostring(id) ~= tostring(os.getComputerID()) and btn_y <= mh then
+                    local lbl = st.label or ("Station #" .. id)
+                    if st.is_hub then lbl = "\4 " .. lbl end
+
+                    monitor.setCursorPos(2, btn_y)
+                    monitor.setBackgroundColor(colors.blue)
+                    monitor.setTextColor(colors.white)
+                    local btn_text = " " .. lbl:sub(1, mw - 4) .. string.rep(" ", math.max(0, mw - 4 - #lbl))
+                    monitor.write(btn_text)
+                    monitor.setBackgroundColor(colors.black)
+
+                    mon_btn(btn_y, btn_y, "dispatch_to", {id = id, label = lbl})
+                    btn_y = btn_y + 2
+                end
+            end
+        else
+            monitor.setCursorPos(2, btn_y)
+            monitor.setTextColor(colors.gray)
+            monitor.write("No route data")
+        end
     end
 
-    -- Switch + bay status at bottom
-    if #station_config.switches > 0 then
-        local sy = mh - #station_config.switches
+    -- Switch status at bottom (non-parking switches only)
+    local non_parking = {}
+    for si, sw in ipairs(station_config.switches) do
+        if not sw.parking then table.insert(non_parking, {idx = si, sw = sw}) end
+    end
+    if #non_parking > 0 then
+        local sy = mh - #non_parking
         if sy < btn_y + 1 then sy = btn_y + 1 end
-        monitor.setCursorPos(1, sy)
-        monitor.setTextColor(colors.cyan)
-        monitor.write("SWITCHES:")
-        for si, sw in ipairs(station_config.switches) do
-            if sy + si <= mh then
-                monitor.setCursorPos(2, sy + si)
-                if sw.parking then
-                    local bs = bay_states[si]
-                    local parked = bs and bs.has_train
-                    monitor.setTextColor(parked and colors.lime or colors.gray)
+        if sy <= mh then
+            monitor.setCursorPos(1, sy)
+            monitor.setTextColor(colors.cyan)
+            monitor.write("SWITCHES:")
+            for i, entry in ipairs(non_parking) do
+                if sy + i <= mh then
+                    monitor.setCursorPos(2, sy + i)
+                    monitor.setTextColor(entry.sw.state and colors.lime or colors.gray)
                     monitor.write(string.format("%d. %s [%s]",
-                        si, sw.description or "Bay", parked and "PARKED" or "EMPTY"))
-                else
-                    monitor.setTextColor(sw.state and colors.lime or colors.gray)
-                    monitor.write(string.format("%d. %s [%s]",
-                        si, sw.description or sw.face, sw.state and "ON" or "OFF"))
+                        entry.idx, entry.sw.description or entry.sw.face, entry.sw.state and "ON" or "OFF"))
                 end
             end
         end
@@ -685,7 +996,25 @@ local function render_config_monitor()
 
     local cy = 4
 
+    -- Hub toggle
+    monitor.setCursorPos(1, cy)
+    monitor.setTextColor(colors.white)
+    monitor.write("Mode: ")
+    if station_config.is_hub then
+        monitor.setBackgroundColor(colors.green)
+        monitor.setTextColor(colors.white)
+        monitor.write(" HUB ")
+    else
+        monitor.setBackgroundColor(colors.blue)
+        monitor.setTextColor(colors.white)
+        monitor.write(" REMOTE ")
+    end
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(cy, cy, "toggle_hub", {})
+    cy = cy + 1
+
     -- Rail integrator
+    cy = cy + 1
     monitor.setCursorPos(1, cy)
     monitor.setTextColor(colors.white)
     monitor.write("Powered Rail:")
@@ -727,7 +1056,6 @@ local function render_config_monitor()
     monitor.setCursorPos(1, cy)
     monitor.setTextColor(colors.white)
     monitor.write("Switches:")
-    -- Add switch button
     local add_lbl = "[+ADD]"
     monitor.setCursorPos(mw - #add_lbl + 1, cy)
     monitor.setBackgroundColor(colors.green)
@@ -766,7 +1094,41 @@ local function render_config_monitor()
         cy = cy + 1
     end
 
-    -- Rescan + integrator count
+    -- Player Detector
+    cy = cy + 1
+    if cy <= mh then
+        monitor.setCursorPos(1, cy)
+        monitor.setTextColor(colors.white)
+        monitor.write("Player Detect:")
+        cy = cy + 1
+        if cy <= mh then
+            monitor.setCursorPos(2, cy)
+            if station_config.player_detector then
+                monitor.setTextColor(colors.yellow)
+                monitor.write(station_config.player_detector:sub(1, mw - 12))
+                -- Remove button
+                monitor.setCursorPos(mw - 2, cy)
+                monitor.setBackgroundColor(colors.red)
+                monitor.setTextColor(colors.white)
+                monitor.write("[X]")
+                monitor.setBackgroundColor(colors.black)
+                mon_btn(cy, cy, "remove_player_det", {x1 = mw - 2, x2 = mw})
+            else
+                monitor.setTextColor(colors.gray)
+                monitor.write("NONE")
+                local set_lbl = "[SET]"
+                monitor.setCursorPos(mw - #set_lbl + 1, cy)
+                monitor.setBackgroundColor(colors.blue)
+                monitor.setTextColor(colors.white)
+                monitor.write(set_lbl)
+                monitor.setBackgroundColor(colors.black)
+                mon_btn(cy, cy, "pick_player_det", {x1 = mw - #set_lbl + 1, x2 = mw})
+            end
+        end
+        cy = cy + 1
+    end
+
+    -- Rescan
     cy = cy + 1
     if cy <= mh then
         monitor.setCursorPos(1, cy)
@@ -789,7 +1151,6 @@ local function render_integrator_picker()
     monitor.setBackgroundColor(colors.black)
     monitor.clear()
 
-    -- Back button
     monitor.setCursorPos(1, 1)
     monitor.setBackgroundColor(colors.gray)
     monitor.setTextColor(colors.white)
@@ -797,7 +1158,6 @@ local function render_integrator_picker()
     monitor.setBackgroundColor(colors.black)
     mon_btn(1, 1, "back_to_config", {x1 = 1, x2 = 6})
 
-    -- Title
     local purpose_labels = {
         rail = "POWERED RAIL",
         detector = "DETECTOR RAIL",
@@ -814,7 +1174,6 @@ local function render_integrator_picker()
     monitor.setTextColor(colors.gray)
     monitor.write(string.rep("-", mw))
 
-    -- List integrators
     local cy = 4
     if #redstone_integrators == 0 then
         monitor.setCursorPos(2, cy)
@@ -833,11 +1192,10 @@ local function render_integrator_picker()
             monitor.setCursorPos(1, cy)
             if is_current then
                 monitor.setBackgroundColor(colors.blue)
-                monitor.setTextColor(colors.white)
             else
                 monitor.setBackgroundColor(colors.gray)
-                monitor.setTextColor(colors.white)
             end
+            monitor.setTextColor(colors.white)
             local entry = string.format(" %d. %s %s",
                 i, ri.name:sub(1, mw - 8), is_current and "*" or " ")
             monitor.write(entry .. string.rep(" ", math.max(0, mw - #entry)))
@@ -855,7 +1213,6 @@ local function render_face_picker()
     monitor.setBackgroundColor(colors.black)
     monitor.clear()
 
-    -- Back button
     monitor.setCursorPos(1, 1)
     monitor.setBackgroundColor(colors.gray)
     monitor.setTextColor(colors.white)
@@ -863,7 +1220,6 @@ local function render_face_picker()
     monitor.setBackgroundColor(colors.black)
     mon_btn(1, 1, "back_to_config", {x1 = 1, x2 = 6})
 
-    -- Title
     local purpose_labels = {
         rail = "POWERED RAIL",
         detector = "DETECTOR RAIL",
@@ -886,7 +1242,7 @@ local function render_face_picker()
     elseif config_purpose == "detector" then
         current_face = station_config.detector_face
     else
-        current_face = nil  -- no default for new configs
+        current_face = nil
     end
 
     local cy = 4
@@ -897,11 +1253,10 @@ local function render_face_picker()
         monitor.setCursorPos(1, cy)
         if is_current then
             monitor.setBackgroundColor(colors.blue)
-            monitor.setTextColor(colors.white)
         else
             monitor.setBackgroundColor(colors.gray)
-            monitor.setTextColor(colors.white)
         end
+        monitor.setTextColor(colors.white)
         local entry = string.format(" %d. %s %s", i, face, is_current and "*" or " ")
         monitor.write(entry .. string.rep(" ", math.max(0, mw - #entry)))
         monitor.setBackgroundColor(colors.black)
@@ -931,7 +1286,6 @@ local function render_switch_parking()
     monitor.setTextColor(colors.cyan)
     monitor.write("Is this a parking switch?")
 
-    -- YES button
     monitor.setCursorPos(2, 8)
     monitor.setBackgroundColor(colors.green)
     monitor.setTextColor(colors.white)
@@ -939,13 +1293,61 @@ local function render_switch_parking()
     monitor.setBackgroundColor(colors.black)
     mon_btn(8, 8, "finish_switch", {parking = true})
 
-    -- NO button
     monitor.setCursorPos(2, 10)
     monitor.setBackgroundColor(colors.blue)
     monitor.setTextColor(colors.white)
     monitor.write(" NO - REGULAR  ")
     monitor.setBackgroundColor(colors.black)
     mon_btn(10, 10, "finish_switch", {parking = false})
+end
+
+local function render_player_detector_picker()
+    if not monitor then return end
+
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    monitor.setCursorPos(1, 1)
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(colors.white)
+    monitor.write("< BACK")
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(1, 1, "back_to_config", {x1 = 1, x2 = 6})
+
+    monitor.setCursorPos(1, 2)
+    monitor.setTextColor(colors.cyan)
+    monitor.write("SELECT PLAYER DETECTOR")
+
+    monitor.setCursorPos(1, 3)
+    monitor.setTextColor(colors.gray)
+    monitor.write(string.rep("-", mw))
+
+    scan_player_detectors()
+
+    local cy = 4
+    if #player_detectors == 0 then
+        monitor.setCursorPos(2, cy)
+        monitor.setTextColor(colors.red)
+        monitor.write("No player detectors found!")
+    else
+        for i, pd in ipairs(player_detectors) do
+            if cy > mh then break end
+            local is_current = (pd.name == station_config.player_detector)
+            monitor.setCursorPos(1, cy)
+            if is_current then
+                monitor.setBackgroundColor(colors.blue)
+            else
+                monitor.setBackgroundColor(colors.gray)
+            end
+            monitor.setTextColor(colors.white)
+            local entry = string.format(" %d. %s %s", i, pd.name:sub(1, mw - 8), is_current and "*" or " ")
+            monitor.write(entry .. string.rep(" ", math.max(0, mw - #entry)))
+            monitor.setBackgroundColor(colors.black)
+            mon_btn(cy, cy, "select_player_det", {name = pd.name})
+            cy = cy + 1
+        end
+    end
 end
 
 local function render_monitor()
@@ -960,6 +1362,8 @@ local function render_monitor()
         render_face_picker()
     elseif monitor_mode == "switch_parking" then
         render_switch_parking()
+    elseif monitor_mode == "pick_player_det" then
+        render_player_detector_picker()
     else
         render_main_monitor()
     end
@@ -969,50 +1373,27 @@ end
 -- Update Check (GitHub HTTP)
 -- ========================================
 local function check_for_updates()
-    if not http then
-        print("[update] HTTP API not available")
-        return false
-    end
+    if not http then return false end
     print("[update] Checking github...")
     local ok, resp, err = pcall(http.get, UPDATE_URL)
-    if not ok then
-        print("[update] Error: " .. tostring(resp))
-        return false
-    end
-    if not resp then
-        print("[update] Failed: " .. tostring(err))
-        return false
-    end
+    if not ok or not resp then return false end
     local code = resp.getResponseCode()
     local content = resp.readAll()
     resp.close()
-    if code ~= 200 then
-        print("[update] HTTP " .. tostring(code))
-        return false
-    end
-    if not content or #content < 100 then
-        print("[update] Bad response (" .. #content .. "b)")
-        return false
-    end
+    if code ~= 200 or not content or #content < 100 then return false end
     local sum = 0
     for i = 1, #content do
         sum = (sum * 31 + string.byte(content, i)) % 2147483647
     end
     local remote_ver = tostring(sum)
-    if remote_ver == VERSION then
-        print("[update] Up to date (ver=" .. VERSION .. ")")
-        return false
-    end
-    print("[update] New version! " .. VERSION .. " -> " .. remote_ver .. " (" .. #content .. "b)")
+    if remote_ver == VERSION then return false end
+    print("[update] New version! Updating...")
     local path = shell.getRunningProgram()
     local f = fs.open(path, "w")
-    if not f then
-        print("[update] ERROR: can't write " .. path)
-        return false
-    end
+    if not f then return false end
     f.write(content)
     f.close()
-    print("[update] Written. Rebooting...")
+    print("[update] Rebooting...")
     sleep(0.5)
     os.reboot()
 end
@@ -1020,81 +1401,81 @@ end
 check_for_updates()
 
 -- ========================================
--- Discovery & Registration
+-- Hub Discovery (remote stations only)
 -- ========================================
-local function discover_wraith()
-    print("Searching for Wraith OS...")
-    -- Build integrator name list for Wraith
-    local integrator_names = {}
-    for _, ri in ipairs(redstone_integrators) do
-        table.insert(integrator_names, ri.name)
-    end
-
+local function discover_hub()
+    if station_config.is_hub then return true end
     rednet.broadcast({
-        type = "station",
+        type = "station_ping",
         label = station_config.label,
         id = os.getComputerID(),
-        x = my_x, y = my_y, z = my_z,
-        rail_periph = station_config.rail_periph,
-        rail_face = station_config.rail_face,
-        detector_periph = station_config.detector_periph,
-        detector_face = station_config.detector_face,
-        switches = station_config.switches,
-        storage_bays = station_config.storage_bays,
-        integrators = integrator_names,
-        has_train = has_train,
     }, PROTOCOLS.ping)
 
     local sender, msg = rednet.receive(PROTOCOLS.status, DISCOVERY_TIMEOUT)
-    if sender and type(msg) == "table" and msg.status == "wraith_rail_hub" then
-        WRAITH_ID = sender
+    if sender and type(msg) == "table" and msg.status == "hub_ack" then
+        HUB_ID = sender
         if msg.stations then
             route_data = msg.stations
         end
-        print("Found Wraith OS at #" .. sender)
+        print("Found hub at #" .. sender)
         return true
     end
     return false
 end
 
-local function register_with_wraith()
-    if not WRAITH_ID then return false end
-    -- Build integrator name list for Wraith
-    local integrator_names = {}
-    for _, ri in ipairs(redstone_integrators) do
-        table.insert(integrator_names, ri.name)
-    end
-
-    rednet.send(WRAITH_ID, {
+local function register_with_hub()
+    if not HUB_ID or station_config.is_hub then return false end
+    rednet.send(HUB_ID, {
         label = station_config.label,
+        id = os.getComputerID(),
         x = my_x, y = my_y, z = my_z,
-        rail_periph = station_config.rail_periph,
-        rail_face = station_config.rail_face,
-        detector_periph = station_config.detector_periph,
-        detector_face = station_config.detector_face,
-        switches = station_config.switches,
-        storage_bays = station_config.storage_bays,
-        rules = station_config.rules,
-        integrators = integrator_names,
         has_train = has_train,
+        switches = station_config.switches,
     }, PROTOCOLS.register)
     local sender, msg = rednet.receive(PROTOCOLS.status, 3)
-    if sender == WRAITH_ID and type(msg) == "table" and msg.status == "registered" then
-        print("Registered with Wraith #" .. WRAITH_ID)
+    if sender == HUB_ID and type(msg) == "table" and msg.status == "registered" then
+        print("Registered with hub #" .. HUB_ID)
         return true
     end
     return false
 end
 
 -- ========================================
--- Initial Discovery (non-blocking)
+-- Hub Station List Helper
 -- ========================================
-print("Searching for Wraith OS (background)...")
-discover_wraith()  -- single attempt, don't block
-if WRAITH_ID then
-    register_with_wraith()
-else
-    print("Wraith not found - running standalone")
+local function get_station_list()
+    -- Build station list for broadcasting to remote stations
+    local stations = {}
+    -- Include self (hub)
+    stations[os.getComputerID()] = {
+        label = station_config.label,
+        is_hub = true,
+        x = my_x, y = my_y, z = my_z,
+        has_train = has_train,
+    }
+    -- Include connected stations
+    for id, st in pairs(connected_stations) do
+        stations[id] = {
+            label = st.label,
+            is_hub = false,
+            x = st.x or 0, y = st.y or 0, z = st.z or 0,
+            has_train = st.has_train,
+        }
+    end
+    return stations
+end
+
+-- ========================================
+-- Initial Connection
+-- ========================================
+if not station_config.is_hub then
+    print("Searching for hub...")
+    discover_hub()
+    if HUB_ID then
+        register_with_hub()
+    else
+        print("Hub not found - running standalone")
+    end
 end
 
 -- ========================================
@@ -1105,7 +1486,10 @@ term.setCursorPos(1, 1)
 print("=== Station Client v" .. VERSION .. " ===")
 print("Computer #" .. os.getComputerID())
 print("Station:    " .. station_config.label)
-print("Wraith:     " .. (WRAITH_ID and ("#" .. WRAITH_ID) or "STANDALONE"))
+print("Mode:       " .. (station_config.is_hub and "HUB" or "REMOTE"))
+if not station_config.is_hub then
+    print("Hub:        " .. (HUB_ID and ("#" .. HUB_ID) or "NOT FOUND"))
+end
 print("Position:   " .. my_x .. ", " .. my_y .. ", " .. my_z)
 print("Rail:       " .. tostring(station_config.rail_periph) .. ":" .. station_config.rail_face)
 print("Detector:   " .. tostring(station_config.detector_periph) .. ":" .. station_config.detector_face)
@@ -1124,195 +1508,319 @@ local function command_listener()
     while true do
         local sender, msg, proto = rednet.receive(nil, 1)
 
-        if sender and proto == PROTOCOLS.command and type(msg) == "table" then
-            if msg.action == "dispatch" then
-                print(string.format("DISPATCH to %s", msg.destination_label or "?"))
-                dispatch()
+        if sender and type(msg) == "table" then
 
-            elseif msg.action == "set_switch" then
-                local sw_idx = msg.switch_idx
-                local sw_state = msg.state
-                if sw_idx then
-                    set_switch(sw_idx, sw_state)
+            -- Hub: handle pings from remote stations
+            if station_config.is_hub and proto == PROTOCOLS.ping then
+                rednet.send(sender, {
+                    status = "hub_ack",
+                    stations = get_station_list(),
+                }, PROTOCOLS.status)
+
+            -- Hub: handle registration from remote stations
+            elseif station_config.is_hub and proto == PROTOCOLS.register then
+                connected_stations[sender] = {
+                    id = sender,
+                    label = msg.label or ("Station #" .. sender),
+                    x = msg.x or 0,
+                    y = msg.y or 0,
+                    z = msg.z or 0,
+                    has_train = msg.has_train or false,
+                    switches = msg.switches or {},
+                    online = true,
+                    last_seen = os.clock(),
+                }
+                print("Station registered: " .. (msg.label or "#" .. sender))
+                rednet.send(sender, {
+                    status = "registered",
+                }, PROTOCOLS.status)
+                -- Broadcast updated station list to all connected stations
+                local stations = get_station_list()
+                for id, _ in pairs(connected_stations) do
+                    rednet.send(id, {stations = stations}, PROTOCOLS.status)
                 end
 
-            elseif msg.action == "brake" then
-                brake_on()
+            -- Hub: handle heartbeats from remote stations
+            elseif station_config.is_hub and proto == PROTOCOLS.heartbeat and type(msg) == "table" then
+                local st = connected_stations[sender]
+                if st then
+                    st.last_seen = os.clock()
+                    st.online = true
+                    if msg.has_train ~= nil then st.has_train = msg.has_train end
+                    if msg.players_nearby ~= nil then st.players_nearby = msg.players_nearby end
+                    if msg.label then st.label = msg.label end
+                end
 
-            elseif msg.action == "set_rail" then
-                -- Configure rail integrator + face
-                station_config.rail_periph = msg.peripheral_name or station_config.rail_periph
-                station_config.rail_face = msg.face or station_config.rail_face
-                save_config()
-                brake_on()
-                print(string.format("Rail set to: %s:%s",
-                    station_config.rail_periph, station_config.rail_face))
+            -- Remote: handle status updates from hub
+            elseif not station_config.is_hub and proto == PROTOCOLS.status then
+                if type(msg) == "table" and msg.stations then
+                    route_data = msg.stations
+                end
 
-            elseif msg.action == "set_detector" then
-                -- Configure detector integrator + face
-                station_config.detector_periph = msg.peripheral_name or station_config.detector_periph
-                station_config.detector_face = msg.face or station_config.detector_face
-                save_config()
-                print(string.format("Detector set to: %s:%s",
-                    station_config.detector_periph, station_config.detector_face))
+            -- Both: handle direct commands
+            elseif proto == PROTOCOLS.command then
+                if msg.action == "dispatch" then
+                    print(string.format("DISPATCH to %s", msg.destination_label or "?"))
+                    dispatch()
 
-            elseif msg.action == "set_label" then
-                station_config.label = msg.label
-                save_config()
-                print("Label set to: " .. station_config.label)
+                elseif msg.action == "set_switch" then
+                    if msg.switch_idx then
+                        set_switch(msg.switch_idx, msg.state)
+                    end
 
-            elseif msg.action == "add_switch" then
-                table.insert(station_config.switches, {
-                    peripheral_name = msg.peripheral_name,
-                    face = msg.face or "top",
-                    description = msg.description or "Switch",
-                    state = false,
-                    routes = msg.routes or {},
-                    parking = msg.parking or false,
-                })
-                save_config()
-                print("Switch added: " .. (msg.description or "Switch"))
+                elseif msg.action == "brake" then
+                    brake_on()
 
-            elseif msg.action == "remove_switch" then
-                if station_config.switches[msg.idx] then
-                    table.remove(station_config.switches, msg.idx)
+                elseif msg.action == "dispatch_from_bay" then
+                    if msg.switch_idx and station_config.switches[msg.switch_idx] then
+                        print(string.format("BAY %d DISPATCH", msg.switch_idx))
+                        dispatch_from_bay(msg.switch_idx)
+                    end
+
+                elseif msg.action == "set_rail" then
+                    station_config.rail_periph = msg.peripheral_name or station_config.rail_periph
+                    station_config.rail_face = msg.face or station_config.rail_face
                     save_config()
-                    print("Switch removed: #" .. msg.idx)
-                end
+                    brake_on()
 
-            elseif msg.action == "update_routes" then
-                if msg.stations then
-                    route_data = msg
-                end
-
-            elseif msg.action == "set_has_train" then
-                has_train = msg.value or false
-
-            elseif msg.action == "add_rule" then
-                table.insert(station_config.rules, msg.rule)
-                save_config()
-
-            elseif msg.action == "remove_rule" then
-                if station_config.rules[msg.idx] then
-                    table.remove(station_config.rules, msg.idx)
+                elseif msg.action == "set_detector" then
+                    station_config.detector_periph = msg.peripheral_name or station_config.detector_periph
+                    station_config.detector_face = msg.face or station_config.detector_face
                     save_config()
-                end
 
-            elseif msg.action == "dispatch_from_bay" then
-                local sw_idx = msg.switch_idx
-                if sw_idx and station_config.switches[sw_idx] then
-                    print(string.format("BAY %d DISPATCH", sw_idx))
-                    dispatch_from_bay(sw_idx)
-                end
-
-            elseif msg.action == "set_bay_rail" then
-                local sw_idx = msg.switch_idx
-                local sw = station_config.switches[sw_idx]
-                if sw and sw.parking then
-                    sw.bay_rail_periph = msg.peripheral_name or sw.bay_rail_periph
-                    sw.bay_rail_face = msg.face or sw.bay_rail_face
+                elseif msg.action == "set_label" then
+                    station_config.label = msg.label
                     save_config()
-                    bay_brake_on(sw_idx)
-                end
 
-            elseif msg.action == "set_bay_detector" then
-                local sw_idx = msg.switch_idx
-                local sw = station_config.switches[sw_idx]
-                if sw and sw.parking then
-                    sw.bay_detector_periph = msg.peripheral_name or sw.bay_detector_periph
-                    sw.bay_detector_face = msg.face or sw.bay_detector_face
+                elseif msg.action == "add_switch" then
+                    table.insert(station_config.switches, {
+                        peripheral_name = msg.peripheral_name,
+                        face = msg.face or "top",
+                        description = msg.description or "Switch",
+                        state = false,
+                        routes = msg.routes or {},
+                        parking = msg.parking or false,
+                    })
                     save_config()
-                    init_bay_states()
-                end
-            end
 
-            -- Send updated status back
-            if WRAITH_ID then
-                -- Collect bay train states
-                local bay_train_states = {}
-                for i, sw in ipairs(station_config.switches) do
-                    if sw.parking then
-                        local bs = bay_states[i]
-                        bay_train_states[i] = bs and bs.has_train or false
+                elseif msg.action == "remove_switch" then
+                    if station_config.switches[msg.idx] then
+                        table.remove(station_config.switches, msg.idx)
+                        save_config()
+                    end
+
+                elseif msg.action == "request_train" then
+                    -- Remote station requesting a train (hub only)
+                    if station_config.is_hub and not pending_outbound and not pending_destination then
+                        pending_outbound = {
+                            station_id = msg.station_id or sender,
+                            label = msg.label or ("Station #" .. sender),
+                        }
+                        local bay_idx = nil
+                        for i, sw in ipairs(station_config.switches) do
+                            if sw.parking then
+                                local bs = bay_states[i]
+                                if bs and bs.has_train then
+                                    bay_idx = i
+                                    break
+                                end
+                            end
+                        end
+                        if bay_idx then
+                            for i, sw in ipairs(station_config.switches) do
+                                if sw.parking then
+                                    set_switch(i, i ~= bay_idx)
+                                end
+                            end
+                            print("[hub] Pulling from bay " .. bay_idx .. " for " .. pending_outbound.label)
+                            dispatch_from_bay(bay_idx)
+                        else
+                            print("[hub] No trains available for " .. pending_outbound.label)
+                            rednet.send(sender, {action = "train_unavailable"}, PROTOCOLS.command)
+                            pending_outbound = nil
+                        end
+                    elseif station_config.is_hub then
+                        -- Hub busy, reject
+                        rednet.send(sender, {action = "train_unavailable"}, PROTOCOLS.command)
+                    end
+
+                elseif msg.action == "train_unavailable" then
+                    -- Hub told us no trains available
+                    if pending_destination and not has_train then
+                        print("No trains available at hub")
+                        pending_destination = nil
+                        departure_countdown = nil
                     end
                 end
-                rednet.send(WRAITH_ID, {
-                    rules = station_config.rules,
-                    switches = station_config.switches,
-                    storage_bays = station_config.storage_bays,
-                    rail_periph = station_config.rail_periph,
-                    rail_face = station_config.rail_face,
-                    detector_periph = station_config.detector_periph,
-                    detector_face = station_config.detector_face,
-                    has_train = has_train,
-                    bay_train_states = bay_train_states,
-                }, PROTOCOLS.status)
             end
-
-        elseif sender and proto == PROTOCOLS.status then
-            if type(msg) == "table" and msg.stations then
-                route_data = msg.stations
-            end
-        end
-    end
-end
-
-local function heartbeat_sender()
-    while true do
-        sleep(HEARTBEAT_INTERVAL)
-        if WRAITH_ID then
-            local bay_train_states = {}
-            for i, sw in ipairs(station_config.switches) do
-                if sw.parking then
-                    local bs = bay_states[i]
-                    bay_train_states[i] = bs and bs.has_train or false
-                end
-            end
-            rednet.send(WRAITH_ID, {
-                id = os.getComputerID(),
-                label = station_config.label,
-                has_train = has_train,
-                bay_train_states = bay_train_states,
-            }, PROTOCOLS.heartbeat)
         end
     end
 end
 
 local function discovery_loop()
-    local missed_pings = 0
-    while true do
-        if not WRAITH_ID then
-            -- Not connected: try to discover
-            if discover_wraith() then
-                register_with_wraith()
-                print("Connected to Wraith #" .. tostring(WRAITH_ID))
-            end
-            sleep(DISCOVERY_INTERVAL)
-        else
-            -- Connected: periodic ping
-            sleep(60)
-            rednet.send(WRAITH_ID, {
-                type = "station",
-                label = station_config.label,
-                id = os.getComputerID(),
-                x = my_x, y = my_y, z = my_z,
-                has_train = has_train,
-            }, PROTOCOLS.ping)
-            local _, resp = rednet.receive(PROTOCOLS.status, 5)
-            if not resp then
-                missed_pings = missed_pings + 1
-                if missed_pings >= 3 then
-                    print("Lost Wraith connection. Retrying...")
-                    WRAITH_ID = nil
-                    missed_pings = 0
-                end
-            else
-                missed_pings = 0
-                if type(resp) == "table" and resp.stations then
-                    route_data = resp.stations
+    if station_config.is_hub then
+        -- Hub: check for offline stations
+        while true do
+            sleep(10)
+            local now = os.clock()
+            for id, st in pairs(connected_stations) do
+                if st.online and st.last_seen > 0 and (now - st.last_seen) > 30 then
+                    st.online = false
+                    print("Station offline: " .. (st.label or "#" .. id))
                 end
             end
         end
+    else
+        -- Remote: discover and maintain connection to hub
+        local missed_pings = 0
+        while true do
+            if not HUB_ID then
+                if discover_hub() then
+                    register_with_hub()
+                end
+                sleep(DISCOVERY_INTERVAL)
+            else
+                sleep(60)
+                check_players_nearby()
+                rednet.send(HUB_ID, {
+                    id = os.getComputerID(),
+                    label = station_config.label,
+                    has_train = has_train,
+                    players_nearby = players_nearby,
+                }, PROTOCOLS.heartbeat)
+                local _, resp = rednet.receive(PROTOCOLS.status, 5)
+                if not resp then
+                    missed_pings = missed_pings + 1
+                    if missed_pings >= 3 then
+                        print("Lost hub connection. Retrying...")
+                        HUB_ID = nil
+                        missed_pings = 0
+                    end
+                else
+                    missed_pings = 0
+                    if type(resp) == "table" and resp.stations then
+                        route_data = resp.stations
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Handles all train arrivals: outbound dispatch, departure countdown, or auto-park
+local function train_arrival_handler()
+    while true do
+        os.pullEvent("train_arrived")
+
+        if station_config.is_hub and pending_outbound then
+            -- Hub: train pulled from bay, dispatch to requesting station
+            local target = pending_outbound
+            pending_outbound = nil
+            print("[hub] Train ready, sending to " .. (target.label or "#" .. target.station_id))
+            os.sleep(1)
+            if has_train then
+                dispatch()
+            end
+
+        elseif pending_destination then
+            -- Train arrived with a pending destination - trigger countdown
+            os.queueEvent("departure_start")
+
+        elseif station_config.is_hub then
+            -- Hub: no pending jobs, auto-park after delay
+            print("[auto-park] Train arrived, waiting " .. AUTO_PARK_DELAY .. "s...")
+            local park_timer = os.startTimer(AUTO_PARK_DELAY)
+            local should_park = true
+            while true do
+                local e, p1 = os.pullEvent()
+                if e == "timer" and p1 == park_timer then
+                    break
+                elseif e == "train_departed" then
+                    print("[auto-park] Cancelled (train dispatched)")
+                    should_park = false
+                    break
+                elseif e == "destination_selected" then
+                    print("[auto-park] Cancelled (destination selected)")
+                    should_park = false
+                    break
+                end
+            end
+            if should_park and has_train then
+                check_players_nearby()
+                if players_nearby then
+                    print("[auto-park] Players nearby, waiting for them to leave...")
+                    while true do
+                        if not has_train then
+                            print("[auto-park] Cancelled (train departed while waiting)")
+                            should_park = false
+                            break
+                        end
+                        check_players_nearby()
+                        if not players_nearby then
+                            print("[auto-park] Players left, parking now...")
+                            break
+                        end
+                        os.sleep(PLAYER_CHECK_INTERVAL)
+                    end
+                end
+                if should_park and has_train then
+                    print("[auto-park] Parking train...")
+                    auto_park()
+                end
+            end
+        end
+    end
+end
+
+-- Handles the 30-second departure countdown
+local function departure_handler()
+    while true do
+        os.pullEvent("departure_start")
+
+        if not pending_destination then goto skip end
+
+        departure_countdown = 30
+        print("[depart] Countdown 30s -> " .. pending_destination.label)
+
+        local tick = os.startTimer(1)
+        local cancelled = false
+
+        while departure_countdown > 0 do
+            local e, p1 = os.pullEvent()
+            if e == "timer" and p1 == tick then
+                departure_countdown = departure_countdown - 1
+                if departure_countdown > 0 then
+                    tick = os.startTimer(1)
+                end
+            elseif e == "train_departed" then
+                print("[depart] Cancelled (train left)")
+                cancelled = true
+                break
+            elseif e == "cancel_departure" then
+                print("[depart] Cancelled by user")
+                cancelled = true
+                break
+            end
+        end
+
+        if not cancelled and has_train and pending_destination then
+            local dest = pending_destination
+            -- Notify hub about outbound dispatch
+            if HUB_ID and HUB_ID ~= os.getComputerID() then
+                rednet.send(HUB_ID, {
+                    action = "request_dispatch",
+                    from = os.getComputerID(),
+                    to = dest.id,
+                }, PROTOCOLS.command)
+            end
+            print("[depart] Dispatching to " .. dest.label)
+            dispatch()
+        end
+
+        pending_destination = nil
+        departure_countdown = nil
+
+        ::skip::
     end
 end
 
@@ -1330,18 +1838,14 @@ local function monitor_touch_loop()
     while true do
         local ev, side, tx, ty = os.pullEvent("monitor_touch")
 
-        -- Find which button was tapped
         for _, btn in ipairs(monitor_buttons) do
             if ty >= btn.y1 and ty <= btn.y2 then
-                -- Some buttons also check x range
                 if btn.data and btn.data.x1 then
                     if tx < btn.data.x1 or tx > btn.data.x2 then
-                        -- Outside x range, skip
                         goto continue
                     end
                 end
 
-                -- Handle action
                 if btn.action == "open_config" then
                     monitor_mode = "config"
                     render_monitor()
@@ -1355,17 +1859,63 @@ local function monitor_touch_loop()
                     config_purpose = nil
                     render_monitor()
 
+                elseif btn.action == "toggle_hub" then
+                    station_config.is_hub = not station_config.is_hub
+                    if station_config.is_hub then
+                        HUB_ID = os.getComputerID()
+                    else
+                        HUB_ID = nil
+                    end
+                    save_config()
+                    render_monitor()
+
                 elseif btn.action == "dispatch_to" then
-                    if has_train then
-                        print("Destination selected: " .. btn.data.label)
-                        if WRAITH_ID then
-                            rednet.send(WRAITH_ID, {
-                                action = "request_dispatch",
-                                from = os.getComputerID(),
-                                to = btn.data.id,
-                            }, PROTOCOLS.status)
+                    if not pending_destination then
+                        pending_destination = {id = btn.data.id, label = btn.data.label}
+                        if has_train then
+                            -- Train already here, start countdown
+                            os.queueEvent("departure_start")
+                            os.queueEvent("destination_selected")
+                            print("Departing to " .. btn.data.label .. " in 30s")
+                        else
+                            -- No train, request one
+                            if station_config.is_hub then
+                                -- Hub: pull from parking bay
+                                local bay_idx = nil
+                                for i, sw in ipairs(station_config.switches) do
+                                    if sw.parking then
+                                        local bs = bay_states[i]
+                                        if bs and bs.has_train then
+                                            bay_idx = i
+                                            break
+                                        end
+                                    end
+                                end
+                                if bay_idx then
+                                    for i, sw in ipairs(station_config.switches) do
+                                        if sw.parking then
+                                            set_switch(i, i ~= bay_idx)
+                                        end
+                                    end
+                                    print("[hub] Pulling from bay " .. bay_idx .. " for departure")
+                                    dispatch_from_bay(bay_idx)
+                                else
+                                    print("No parked trains available!")
+                                    pending_destination = nil
+                                end
+                            elseif HUB_ID then
+                                -- Remote: ask hub for a train
+                                rednet.send(HUB_ID, {
+                                    action = "request_train",
+                                    station_id = os.getComputerID(),
+                                    label = station_config.label,
+                                }, PROTOCOLS.command)
+                                print("Requesting train from hub for " .. btn.data.label)
+                            else
+                                print("No hub connected!")
+                                pending_destination = nil
+                            end
                         end
-                        dispatch()
                         render_monitor()
                     end
 
@@ -1417,12 +1967,10 @@ local function monitor_touch_loop()
                         monitor_mode = "switch_parking"
                     elseif config_purpose == "bay_detector" then
                         pending_switch.bay_detector_face = btn.data.face
-                        -- Continue to bay rail setup
                         config_purpose = "bay_rail"
                         monitor_mode = "pick_integrator"
                     elseif config_purpose == "bay_rail" then
                         pending_switch.bay_rail_face = btn.data.face
-                        -- All done, save the parking switch
                         local sw_idx = #station_config.switches + 1
                         table.insert(station_config.switches, {
                             peripheral_name = pending_switch.peripheral_name,
@@ -1438,17 +1986,13 @@ local function monitor_touch_loop()
                             bay_has_train = false,
                         })
                         save_config()
-                        -- Init bay state
                         bay_states[sw_idx] = {
                             last_signal = false,
                             last_toggle_time = 0,
                             has_train = false,
                         }
-                        -- Brake the bay rail
                         bay_brake_on(sw_idx)
-                        print("Parking bay added: " .. pending_switch.peripheral_name .. ":" .. pending_switch.face
-                            .. " det=" .. pending_switch.bay_detector_periph .. ":" .. pending_switch.bay_detector_face
-                            .. " rail=" .. pending_switch.bay_rail_periph .. ":" .. pending_switch.bay_rail_face)
+                        print("Parking bay added: " .. pending_switch.peripheral_name .. ":" .. pending_switch.face)
                         pending_switch = nil
                         config_purpose = nil
                         monitor_mode = "config"
@@ -1465,12 +2009,10 @@ local function monitor_touch_loop()
                     if pending_switch then
                         pending_switch.parking = btn.data.parking
                         if btn.data.parking then
-                            -- Parking bay: continue to bay detector setup
                             config_purpose = "bay_detector"
                             monitor_mode = "pick_integrator"
                             render_monitor()
                         else
-                            -- Regular switch: save now
                             table.insert(station_config.switches, {
                                 peripheral_name = pending_switch.peripheral_name,
                                 face = pending_switch.face,
@@ -1480,7 +2022,6 @@ local function monitor_touch_loop()
                                 parking = false,
                             })
                             save_config()
-                            print("Switch added: " .. pending_switch.peripheral_name .. ":" .. pending_switch.face)
                             pending_switch = nil
                             config_purpose = nil
                             monitor_mode = "config"
@@ -1497,9 +2038,35 @@ local function monitor_touch_loop()
                     end
                     render_monitor()
 
+                elseif btn.action == "cancel_departure" then
+                    print("Departure cancelled")
+                    pending_destination = nil
+                    departure_countdown = nil
+                    os.queueEvent("cancel_departure")
+                    render_monitor()
+
+                elseif btn.action == "pick_player_det" then
+                    monitor_mode = "pick_player_det"
+                    render_monitor()
+
+                elseif btn.action == "select_player_det" then
+                    station_config.player_detector = btn.data.name
+                    save_config()
+                    print("Player detector set: " .. btn.data.name)
+                    monitor_mode = "config"
+                    render_monitor()
+
+                elseif btn.action == "remove_player_det" then
+                    station_config.player_detector = nil
+                    players_nearby = false
+                    save_config()
+                    print("Player detector removed")
+                    render_monitor()
+
                 elseif btn.action == "rescan" then
                     scan_integrators()
-                    print("Rescanned: " .. #redstone_integrators .. " integrators found")
+                    scan_player_detectors()
+                    print("Rescanned: " .. #redstone_integrators .. " integrators, " .. #player_detectors .. " player detectors")
                     render_monitor()
                 end
 
@@ -1519,8 +2086,6 @@ local function check_all_bay_detectors()
 end
 
 local function detector_loop()
-    -- Event-driven: listen for AP "redstoneIntegrator" events (instant).
-    -- Fallback: poll every DETECTOR_FALLBACK_POLL for AP <0.8 where events don't exist.
     print("[detector] Loop started (poll=" .. DETECTOR_FALLBACK_POLL .. "s)")
     local bay_count = 0
     for i, sw in ipairs(station_config.switches) do
@@ -1536,7 +2101,6 @@ local function detector_loop()
             if p2 == station_config.detector_periph then
                 check_detector()
             end
-            -- Check if it matches any bay detector
             for i, sw in ipairs(station_config.switches) do
                 if sw.parking and p2 == sw.bay_detector_periph then
                     check_bay_detector(i)
@@ -1553,6 +2117,16 @@ local function detector_loop()
     end
 end
 
+local function player_check_loop()
+    if not station_config.player_detector then
+        while true do sleep(60) end
+    end
+    while true do
+        check_players_nearby()
+        os.sleep(PLAYER_CHECK_INTERVAL)
+    end
+end
+
 local function update_checker()
     while true do
         sleep(300)
@@ -1562,10 +2136,12 @@ end
 
 parallel.waitForAll(
     command_listener,
-    heartbeat_sender,
     discovery_loop,
+    train_arrival_handler,
+    departure_handler,
     monitor_loop,
     monitor_touch_loop,
     detector_loop,
+    player_check_loop,
     update_checker
 )
