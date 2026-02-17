@@ -989,26 +989,14 @@ local function register_with_wraith()
 end
 
 -- ========================================
--- Discovery Loop
+-- Initial Discovery (non-blocking)
 -- ========================================
-while not WRAITH_ID do
-    if not discover_wraith() then
-        print("Wraith not found, retrying in " .. DISCOVERY_INTERVAL .. "s...")
-        os.sleep(DISCOVERY_INTERVAL)
-    end
-end
-
--- Registration
-local registered = false
-for attempt = 1, 5 do
-    if register_with_wraith() then
-        registered = true
-        break
-    end
-    os.sleep(2)
-end
-if not registered then
-    print("WARNING: Could not confirm registration")
+print("Searching for Wraith OS (background)...")
+discover_wraith()  -- single attempt, don't block
+if WRAITH_ID then
+    register_with_wraith()
+else
+    print("Wraith not found - running standalone")
 end
 
 -- ========================================
@@ -1019,7 +1007,7 @@ term.setCursorPos(1, 1)
 print("=== Station Client v" .. VERSION .. " ===")
 print("Computer #" .. os.getComputerID())
 print("Station:    " .. station_config.label)
-print("Wraith:     #" .. tostring(WRAITH_ID))
+print("Wraith:     " .. (WRAITH_ID and ("#" .. WRAITH_ID) or "STANDALONE"))
 print("Position:   " .. my_x .. ", " .. my_y .. ", " .. my_z)
 print("Rail:       " .. tostring(station_config.rail_periph) .. ":" .. station_config.rail_face)
 print("Detector:   " .. tostring(station_config.detector_periph) .. ":" .. station_config.detector_face)
@@ -1027,7 +1015,7 @@ print("Integrators:" .. #redstone_integrators)
 print("Switches:   " .. #station_config.switches)
 print("Monitor:    " .. (monitor and "YES" or "NO"))
 print("")
-print("Listening for commands...")
+print("Listening...")
 print("")
 
 -- ========================================
@@ -1151,8 +1139,16 @@ end
 local function discovery_loop()
     local missed_pings = 0
     while true do
-        sleep(60)
-        if WRAITH_ID then
+        if not WRAITH_ID then
+            -- Not connected: try to discover
+            if discover_wraith() then
+                register_with_wraith()
+                print("Connected to Wraith #" .. tostring(WRAITH_ID))
+            end
+            sleep(DISCOVERY_INTERVAL)
+        else
+            -- Connected: periodic ping
+            sleep(60)
             rednet.send(WRAITH_ID, {
                 type = "station",
                 label = station_config.label,
@@ -1164,13 +1160,9 @@ local function discovery_loop()
             if not resp then
                 missed_pings = missed_pings + 1
                 if missed_pings >= 3 then
-                    print("Lost connection (3 missed). Rediscovering...")
+                    print("Lost Wraith connection. Retrying...")
                     WRAITH_ID = nil
                     missed_pings = 0
-                    while not WRAITH_ID do
-                        if discover_wraith() then break end
-                        sleep(DISCOVERY_INTERVAL)
-                    end
                 end
             else
                 missed_pings = 0
