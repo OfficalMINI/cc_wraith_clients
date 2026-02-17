@@ -272,14 +272,17 @@ local function run_setup()
             write("Switch description: ")
             local sw_desc = read()
             if sw_desc == "" then sw_desc = "Switch " .. (#station_config.switches + 1) end
+            write("Is this a parking bay switch? [y/N]: ")
+            local is_parking = read()
             table.insert(station_config.switches, {
                 peripheral_name = sw_periph,
                 face = sw_face,
                 description = sw_desc,
                 state = false,
                 routes = {},
+                parking = (is_parking == "y" or is_parking == "Y"),
             })
-            print("Added: " .. sw_desc .. " [" .. sw_periph .. ":" .. sw_face .. "]")
+            print("Added: " .. sw_desc .. " [" .. sw_periph .. ":" .. sw_face .. "]" .. (is_parking == "y" and " (PARKING)" or ""))
             write("Add another switch? [y/N]: ")
             local more = read()
             if more ~= "y" and more ~= "Y" then break end
@@ -464,8 +467,9 @@ end
 local route_data = nil   -- received from Wraith
 
 -- Monitor UI state
-local monitor_mode = "main"  -- "main", "config", "pick_integrator", "pick_face"
-local config_purpose = nil   -- "rail" or "detector" (what we're currently configuring)
+local monitor_mode = "main"  -- "main", "config", "pick_integrator", "pick_face", "switch_face", "switch_parking"
+local config_purpose = nil   -- "rail", "detector", or "switch"
+local pending_switch = nil   -- temp switch being built: {peripheral_name, face, parking}
 local monitor_buttons = {}   -- rebuilt each render: {{y1, y2, action, data}, ...}
 
 local function mon_btn(y1, y2, action, data)
@@ -641,30 +645,58 @@ local function render_config_monitor()
     mon_btn(cy, cy, "pick_detector", {x1 = mw - 7, x2 = mw})
     cy = cy + 1
 
-    -- Switches summary
+    -- Switches section
     cy = cy + 1
     monitor.setCursorPos(1, cy)
-    monitor.setTextColor(colors.gray)
-    monitor.write(string.format("Switches: %d configured", #station_config.switches))
+    monitor.setTextColor(colors.white)
+    monitor.write("Switches:")
+    -- Add switch button
+    local add_lbl = "[+ADD]"
+    monitor.setCursorPos(mw - #add_lbl + 1, cy)
+    monitor.setBackgroundColor(colors.green)
+    monitor.setTextColor(colors.white)
+    monitor.write(add_lbl)
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(cy, cy, "add_switch_start", {x1 = mw - #add_lbl + 1, x2 = mw})
     cy = cy + 1
 
-    -- Integrators summary
-    cy = cy + 1
-    monitor.setCursorPos(1, cy)
-    monitor.setTextColor(colors.gray)
-    monitor.write(string.format("Integrators found: %d", #redstone_integrators))
-    cy = cy + 1
+    for si, sw in ipairs(station_config.switches) do
+        if cy > mh - 3 then break end
+        monitor.setCursorPos(2, cy)
+        local tag = sw.parking and " P" or ""
+        monitor.setTextColor(sw.state and colors.lime or colors.yellow)
+        monitor.write(string.format("%d.%s %s [%s]",
+            si, tag, (sw.description or "Switch"):sub(1, mw - 14),
+            sw.state and "ON" or "OFF"))
+        -- Delete button
+        monitor.setCursorPos(mw - 2, cy)
+        monitor.setBackgroundColor(colors.red)
+        monitor.setTextColor(colors.white)
+        monitor.write("[X]")
+        monitor.setBackgroundColor(colors.black)
+        mon_btn(cy, cy, "remove_switch", {idx = si, x1 = mw - 2, x2 = mw})
+        cy = cy + 1
+    end
+    if #station_config.switches == 0 then
+        monitor.setCursorPos(2, cy)
+        monitor.setTextColor(colors.gray)
+        monitor.write("None")
+        cy = cy + 1
+    end
 
-    -- Rescan button
+    -- Rescan + integrator count
     cy = cy + 1
     if cy <= mh then
-        monitor.setCursorPos(2, cy)
+        monitor.setCursorPos(1, cy)
+        monitor.setTextColor(colors.gray)
+        monitor.write("Integrators: " .. #redstone_integrators)
+        local rescan_lbl = "[RESCAN]"
+        monitor.setCursorPos(mw - #rescan_lbl + 1, cy)
         monitor.setBackgroundColor(colors.gray)
         monitor.setTextColor(colors.white)
-        local rescan_lbl = " RESCAN PERIPHERALS "
         monitor.write(rescan_lbl)
         monitor.setBackgroundColor(colors.black)
-        mon_btn(cy, cy, "rescan", {x1 = 2, x2 = 2 + #rescan_lbl - 1})
+        mon_btn(cy, cy, "rescan", {x1 = mw - #rescan_lbl + 1, x2 = mw})
     end
 end
 
@@ -780,6 +812,44 @@ local function render_face_picker()
     end
 end
 
+local function render_switch_parking()
+    if not monitor then return end
+
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    monitor.setCursorPos(1, 1)
+    monitor.setTextColor(colors.cyan)
+    monitor.write("NEW SWITCH")
+
+    monitor.setCursorPos(1, 3)
+    monitor.setTextColor(colors.white)
+    monitor.write("Integrator: " .. (pending_switch and pending_switch.peripheral_name or "?"))
+    monitor.setCursorPos(1, 4)
+    monitor.write("Face: " .. (pending_switch and pending_switch.face or "?"))
+
+    monitor.setCursorPos(1, 6)
+    monitor.setTextColor(colors.cyan)
+    monitor.write("Is this a parking switch?")
+
+    -- YES button
+    monitor.setCursorPos(2, 8)
+    monitor.setBackgroundColor(colors.green)
+    monitor.setTextColor(colors.white)
+    monitor.write(" YES - PARKING ")
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(8, 8, "finish_switch", {parking = true})
+
+    -- NO button
+    monitor.setCursorPos(2, 10)
+    monitor.setBackgroundColor(colors.blue)
+    monitor.setTextColor(colors.white)
+    monitor.write(" NO - REGULAR  ")
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(10, 10, "finish_switch", {parking = false})
+end
+
 local function render_monitor()
     if not monitor then return end
     monitor_buttons = {}
@@ -790,6 +860,8 @@ local function render_monitor()
         render_integrator_picker()
     elseif monitor_mode == "pick_face" then
         render_face_picker()
+    elseif monitor_mode == "switch_parking" then
+        render_switch_parking()
     else
         render_main_monitor()
     end
@@ -1010,6 +1082,7 @@ local function command_listener()
                     description = msg.description or "Switch",
                     state = false,
                     routes = msg.routes or {},
+                    parking = msg.parking or false,
                 })
                 save_config()
                 print("Switch added: " .. (msg.description or "Switch"))
@@ -1175,29 +1248,68 @@ local function monitor_touch_loop()
                 elseif btn.action == "select_integrator" then
                     if config_purpose == "rail" then
                         station_config.rail_periph = btn.data.name
+                        save_config()
+                        monitor_mode = "pick_face"
                     elseif config_purpose == "detector" then
                         station_config.detector_periph = btn.data.name
+                        save_config()
+                        monitor_mode = "pick_face"
+                    elseif config_purpose == "switch" then
+                        pending_switch = {peripheral_name = btn.data.name}
+                        monitor_mode = "pick_face"
                     end
-                    save_config()
-                    -- Now pick face
-                    monitor_mode = "pick_face"
                     render_monitor()
 
                 elseif btn.action == "select_face" then
                     if config_purpose == "rail" then
                         station_config.rail_face = btn.data.face
-                        brake_on()  -- re-apply brake with new config
+                        brake_on()
+                        save_config()
+                        monitor_mode = "config"
+                        config_purpose = nil
                     elseif config_purpose == "detector" then
                         station_config.detector_face = btn.data.face
+                        save_config()
+                        monitor_mode = "config"
+                        config_purpose = nil
+                    elseif config_purpose == "switch" then
+                        pending_switch.face = btn.data.face
+                        monitor_mode = "switch_parking"
                     end
-                    save_config()
-                    print(string.format("Config updated: %s -> %s:%s",
-                        config_purpose,
-                        config_purpose == "rail" and station_config.rail_periph or station_config.detector_periph,
-                        btn.data.face))
-                    -- Return to config menu
-                    monitor_mode = "config"
+                    render_monitor()
+
+                elseif btn.action == "add_switch_start" then
+                    config_purpose = "switch"
+                    pending_switch = nil
+                    monitor_mode = "pick_integrator"
+                    render_monitor()
+
+                elseif btn.action == "finish_switch" then
+                    if pending_switch then
+                        table.insert(station_config.switches, {
+                            peripheral_name = pending_switch.peripheral_name,
+                            face = pending_switch.face,
+                            description = "Switch " .. (#station_config.switches + 1),
+                            state = false,
+                            routes = {},
+                            parking = btn.data.parking,
+                        })
+                        save_config()
+                        print("Switch added: " .. pending_switch.peripheral_name .. ":" .. pending_switch.face
+                            .. (btn.data.parking and " (PARKING)" or ""))
+                    end
+                    pending_switch = nil
                     config_purpose = nil
+                    monitor_mode = "config"
+                    render_monitor()
+
+                elseif btn.action == "remove_switch" then
+                    local idx = btn.data.idx
+                    if station_config.switches[idx] then
+                        print("Switch removed: " .. (station_config.switches[idx].description or "#" .. idx))
+                        table.remove(station_config.switches, idx)
+                        save_config()
+                    end
                     render_monitor()
 
                 elseif btn.action == "rescan" then
