@@ -148,6 +148,12 @@ end
 rednet.open(modem_side)
 print("Rednet opened on: " .. modem_side .. " (wireless)")
 
+-- Hub: register as discoverable service via rednet DNS
+if station_config.is_hub then
+    rednet.host(PROTOCOLS.ping, "station_hub")
+    print("Hosting station_hub service")
+end
+
 -- ========================================
 -- GPS Position
 -- ========================================
@@ -1441,7 +1447,28 @@ check_for_updates()
 -- ========================================
 local function discover_hub()
     if station_config.is_hub then return true end
-    print("[discovery] Broadcasting ping on " .. PROTOCOLS.ping .. "...")
+
+    -- Method 1: rednet.lookup (CC:Tweaked DNS — most reliable)
+    print("[discovery] Looking up station_hub...")
+    local hub_id = rednet.lookup(PROTOCOLS.ping, "station_hub")
+    if hub_id then
+        HUB_ID = hub_id
+        print("[discovery] Found hub #" .. hub_id .. " via lookup")
+        -- Request station list
+        rednet.send(HUB_ID, {
+            type = "station_ping",
+            label = station_config.label,
+            id = os.getComputerID(),
+        }, PROTOCOLS.ping)
+        local sender, msg = rednet.receive(PROTOCOLS.status, DISCOVERY_TIMEOUT)
+        if sender and type(msg) == "table" and msg.stations then
+            route_data = msg.stations
+        end
+        return true
+    end
+
+    -- Method 2: fallback broadcast
+    print("[discovery] Lookup failed, broadcasting ping...")
     rednet.broadcast({
         type = "station_ping",
         label = station_config.label,
@@ -1454,10 +1481,10 @@ local function discover_hub()
         if msg.stations then
             route_data = msg.stations
         end
-        print("[discovery] Found hub at #" .. sender)
+        print("[discovery] Found hub #" .. sender .. " via broadcast")
         return true
     end
-    print("[discovery] No response (timeout " .. DISCOVERY_TIMEOUT .. "s)")
+    print("[discovery] No hub found")
     return false
 end
 
@@ -2221,12 +2248,14 @@ local function terminal_input()
             elseif cmd == "hub" then
                 station_config.is_hub = true
                 HUB_ID = os.getComputerID()
+                rednet.host(PROTOCOLS.ping, "station_hub")
                 save_config()
-                print("Set as HUB. Restart recommended.")
+                print("Set as HUB + hosting service.")
 
             elseif cmd == "remote" then
                 station_config.is_hub = false
                 HUB_ID = nil
+                pcall(rednet.unhost, PROTOCOLS.ping)
                 save_config()
                 print("Set as REMOTE. Restart recommended.")
 
