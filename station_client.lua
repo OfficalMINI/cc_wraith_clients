@@ -115,7 +115,8 @@ end
 -- ========================================
 -- Modem Setup
 -- ========================================
-local function find_modem()
+local function find_wireless_modem()
+    -- Only look for wireless (ender) modems — never use wired modems for rednet
     for _, side in ipairs({"back", "top", "left", "right", "bottom", "front"}) do
         if peripheral.getType(side) == "modem" then
             local m = peripheral.wrap(side)
@@ -124,17 +125,25 @@ local function find_modem()
             end
         end
     end
-    for _, side in ipairs({"back", "top", "left", "right", "bottom", "front"}) do
-        if peripheral.getType(side) == "modem" then return side end
-    end
     return nil
 end
 
-local modem_side = find_modem()
+local modem_side = find_wireless_modem()
 if not modem_side then
-    printError("No modem found! Attach a wireless modem.")
+    printError("No wireless/ender modem found!")
+    printError("Attach an ender modem directly to this computer.")
+    printError("(Wired modems are for peripherals only)")
+    -- List what modems ARE attached for debugging
+    for _, side in ipairs({"back", "top", "left", "right", "bottom", "front"}) do
+        if peripheral.getType(side) == "modem" then
+            local m = peripheral.wrap(side)
+            local wireless = m and m.isWireless and m.isWireless()
+            print("  Found modem on " .. side .. " (wireless=" .. tostring(wireless) .. ")")
+        end
+    end
     return
 end
+print("Wireless modem: " .. modem_side)
 rednet.open(modem_side)
 
 -- ========================================
