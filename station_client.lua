@@ -510,6 +510,31 @@ local function dispatch_from_bay(sw_idx)
     print("Bay " .. sw_idx .. " dispatch complete, rail braked")
 end
 
+-- ========================================
+-- Track Switch Control (via integrator)
+-- ========================================
+
+local function set_switch(switch_idx, state_on)
+    local sw = station_config.switches[switch_idx]
+    if not sw then return false end
+
+    local periph = get_integrator(sw.peripheral_name)
+    if not periph then
+        print(string.format("Switch %d: integrator '%s' not found",
+            switch_idx, tostring(sw.peripheral_name)))
+        return false
+    end
+
+    local ok = pcall(periph.setOutput, sw.face, state_on)
+    if ok then
+        sw.state = state_on
+        save_config()
+        print(string.format("Switch %d [%s:%s] -> %s",
+            switch_idx, sw.peripheral_name, sw.face, state_on and "ON" or "OFF"))
+    end
+    return ok
+end
+
 -- Auto-park: find empty bay, set switches, dispatch
 local function auto_park()
     if not station_config.is_hub then return end
@@ -632,31 +657,6 @@ end
 
 -- Initial detector check
 check_detector()
-
--- ========================================
--- Track Switch Control (via integrator)
--- ========================================
-
-local function set_switch(switch_idx, state_on)
-    local sw = station_config.switches[switch_idx]
-    if not sw then return false end
-
-    local periph = get_integrator(sw.peripheral_name)
-    if not periph then
-        print(string.format("Switch %d: integrator '%s' not found",
-            switch_idx, tostring(sw.peripheral_name)))
-        return false
-    end
-
-    local ok = pcall(periph.setOutput, sw.face, state_on)
-    if ok then
-        sw.state = state_on
-        save_config()
-        print(string.format("Switch %d [%s:%s] -> %s",
-            switch_idx, sw.peripheral_name, sw.face, state_on and "ON" or "OFF"))
-    end
-    return ok
-end
 
 -- ========================================
 -- Monitor Display
