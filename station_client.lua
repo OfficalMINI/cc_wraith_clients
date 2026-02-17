@@ -352,8 +352,10 @@ brake_on()
 -- when input changes: event, side, peripheral_name.
 -- Slow fallback poll for older AP versions.
 
-local detector_debug = true  -- verbose logging for every read
+local detector_debug = false  -- verbose logging for every read
 local last_signal = false    -- previous detector reading (for edge detection)
+local last_toggle_time = 0   -- debounce: time of last toggle
+local DEBOUNCE_TIME = 2      -- ignore rising edges for N seconds after a toggle
 
 local function check_detector()
     if not station_config.detector_periph then
@@ -390,13 +392,19 @@ local function check_detector()
         print("[det] " .. table.concat(parts, " ") .. " train=" .. tostring(has_train))
     end
 
-    -- Toggle on rising edge: each time signal goes false->true, flip has_train
+    -- Toggle on rising edge with debounce
+    local now = os.clock()
     if signal and not last_signal then
-        has_train = not has_train
-        if has_train then
-            print("[det] >>> TRAIN ARRIVED <<<")
+        if (now - last_toggle_time) >= DEBOUNCE_TIME then
+            has_train = not has_train
+            last_toggle_time = now
+            if has_train then
+                print("[det] >>> TRAIN ARRIVED <<<")
+            else
+                print("[det] >>> TRAIN DEPARTED <<<")
+            end
         else
-            print("[det] >>> TRAIN DEPARTED <<<")
+            print("[det] (edge ignored - debounce)")
         end
     end
     last_signal = signal
