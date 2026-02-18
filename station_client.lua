@@ -519,18 +519,30 @@ local function brake_on()
     end
 end
 
+local DISPATCH_DEPART_TIMEOUT = 30  -- safety timeout waiting for train to cross detector
+
 local function dispatch()
     local ri = get_integrator(station_config.rail_periph)
     if not ri then
         print("ERROR: Rail integrator not found: " .. tostring(station_config.rail_periph))
         return
     end
-    print(string.format("Dispatching: %s:%s -> ON",
+    print(string.format("Dispatching: %s:%s -> ON (held until departure)",
         station_config.rail_periph, station_config.rail_face))
     pcall(ri.setOutput, station_config.rail_face, true)
-    os.sleep(DISPATCH_PULSE)
+    -- Keep rail powered until detector confirms train has actually left
+    local timeout = os.startTimer(DISPATCH_DEPART_TIMEOUT)
+    while true do
+        local e, p1 = os.pullEvent()
+        if e == "train_departed" then
+            print("Train crossed detector, braking rail")
+            break
+        elseif e == "timer" and p1 == timeout then
+            print("WARN: Dispatch timeout (" .. DISPATCH_DEPART_TIMEOUT .. "s), braking rail")
+            break
+        end
+    end
     pcall(ri.setOutput, station_config.rail_face, false)
-    has_train = false
     print("Dispatch complete, rail braked")
 end
 
@@ -555,12 +567,21 @@ local function dispatch_from_bay(sw_idx)
         print("ERROR: Bay rail integrator not found: " .. tostring(sw.bay_rail_periph))
         return
     end
-    print(string.format("Bay %d dispatch: %s:%s -> ON", sw_idx, sw.bay_rail_periph, sw.bay_rail_face))
+    print(string.format("Bay %d dispatch: %s:%s -> ON (held until departure)", sw_idx, sw.bay_rail_periph, sw.bay_rail_face))
     pcall(ri.setOutput, sw.bay_rail_face, true)
-    os.sleep(DISPATCH_PULSE)
+    -- Keep bay rail powered until bay detector confirms train has left
+    local timeout = os.startTimer(DISPATCH_DEPART_TIMEOUT)
+    while true do
+        local e, p1 = os.pullEvent()
+        if e == "bay_departed" and p1 == sw_idx then
+            print("Bay " .. sw_idx .. " train crossed detector, braking rail")
+            break
+        elseif e == "timer" and p1 == timeout then
+            print("WARN: Bay " .. sw_idx .. " dispatch timeout (" .. DISPATCH_DEPART_TIMEOUT .. "s), braking rail")
+            break
+        end
+    end
     pcall(ri.setOutput, sw.bay_rail_face, false)
-    -- Don't clear bay_has_train here — let the detector rail confirm
-    -- the train actually left by toggling when it passes over
     print("Bay " .. sw_idx .. " dispatch complete, rail braked")
 end
 
@@ -723,6 +744,7 @@ local function check_bay_detector(sw_idx)
                 print("[bay " .. sw_idx .. "] >>> TRAIN PARKED <<<")
             else
                 print("[bay " .. sw_idx .. "] >>> BAY EMPTY <<<")
+                os.queueEvent("bay_departed", sw_idx)
             end
         end
     end
@@ -803,6 +825,139 @@ local function clean_item_name(name)
     return short:gsub("_", " "):gsub("(%a)([%w]*)", function(a, b) return a:upper() .. b end)
 end
 
+-- ========================================
+-- Network Map UI State
+-- ========================================
+local map_data = nil              -- cached {stations, hub_id, bay_summary, trip_stats}
+local map_selected_station = nil  -- station ID tapped, nil = overview
+local map_last_fetch = 0
+local MAP_FETCH_INTERVAL = 10
+
+local function map_fetch_data()
+    if station_config.is_hub then
+        -- Hub builds map data locally
+        local stations_out = {}
+        stations_out[os.getComputerID()] = {
+            label = station_config.label,
+            x = my_x, y = my_y, z = my_z,
+            is_hub = true,
+            online = true,
+            has_train = has_train,
+        }
+        for id, st in pairs(connected_stations) do
+            stations_out[id] = {
+                label = st.label,
+                x = st.x or 0, y = st.y or 0, z = st.z or 0,
+                is_hub = false,
+                online = st.online and (os.clock() - st.last_seen) < 15,
+                has_train = st.has_train or false,
+            }
+        end
+        local bay_total, bay_occ = 0, 0
+        for si, sw in ipairs(station_config.switches) do
+            if sw.parking then
+                bay_total = bay_total + 1
+                local bs = bay_states[si]
+                if bs and bs.has_train then bay_occ = bay_occ + 1 end
+            end
+        end
+        map_data = {
+            stations = stations_out,
+            hub_id = os.getComputerID(),
+            bay_summary = {total = bay_total, occupied = bay_occ},
+            trip_stats = {},
+        }
+        -- Also request from Wraith for trip stats
+        if WRAITH_ID then
+            sched_send({action = "get_network_status"})
+        end
+    elseif WRAITH_ID then
+        sched_send({action = "get_network_status"})
+    end
+    map_last_fetch = os.clock()
+end
+
+local function compute_map_layout(stations, hub_id, mw, mh)
+    local map_x1, map_y1 = 2, 3
+    local map_x2, map_y2 = mw - 1, mh - 2
+    local map_w = map_x2 - map_x1 + 1
+    local map_h = map_y2 - map_y1 + 1
+
+    local coords = {}
+    local min_gx, max_gx = math.huge, -math.huge
+    local min_gz, max_gz = math.huge, -math.huge
+    local count = 0
+
+    for id, st in pairs(stations) do
+        local gx = st.x or 0
+        local gz = st.z or 0
+        table.insert(coords, {id = id, gx = gx, gz = gz, st = st})
+        if gx < min_gx then min_gx = gx end
+        if gx > max_gx then max_gx = gx end
+        if gz < min_gz then min_gz = gz end
+        if gz > max_gz then max_gz = gz end
+        count = count + 1
+    end
+
+    if count == 0 then return {} end
+    if count == 1 then
+        local c = coords[1]
+        return {{id = c.id, st = c.st, cx = math.floor(map_x1 + map_w / 2), cy = math.floor(map_y1 + map_h / 2)}}
+    end
+
+    local range_x = math.max(max_gx - min_gx, 10)
+    local range_z = math.max(max_gz - min_gz, 10)
+
+    local result = {}
+    local used = {}
+
+    for _, c in ipairs(coords) do
+        local nx = (c.gx - min_gx) / range_x
+        local nz = (c.gz - min_gz) / range_z
+        local cx = math.floor(map_x1 + nx * (map_w - 1) + 0.5)
+        local cy = math.floor(map_y1 + nz * (map_h - 1) + 0.5)
+        cx = math.max(map_x1, math.min(map_x2, cx))
+        cy = math.max(map_y1, math.min(map_y2, cy))
+
+        local key = cx .. "," .. cy
+        local attempts = 0
+        local offsets = {{1,0},{-1,0},{0,1},{0,-1},{1,1},{-1,1},{1,-1},{-1,-1}}
+        while used[key] and attempts < 8 do
+            local off = offsets[(attempts % #offsets) + 1]
+            cx = math.max(map_x1, math.min(map_x2, cx + off[1]))
+            cy = math.max(map_y1, math.min(map_y2, cy + off[2]))
+            key = cx .. "," .. cy
+            attempts = attempts + 1
+        end
+        used[key] = true
+        table.insert(result, {id = c.id, st = c.st, cx = cx, cy = cy})
+    end
+    return result
+end
+
+local function draw_map_line(mon, x1, y1, x2, y2, color)
+    mon.setTextColor(color)
+    local dx = x2 - x1
+    local dy = y2 - y1
+    local steps = math.max(math.abs(dx), math.abs(dy))
+    if steps <= 1 then return end
+    for i = 1, steps - 1 do
+        local t = i / steps
+        local x = math.floor(x1 + dx * t + 0.5)
+        local y = math.floor(y1 + dy * t + 0.5)
+        mon.setCursorPos(x, y)
+        if math.abs(dy) < math.abs(dx) * 0.3 then
+            mon.write("-")
+        elseif math.abs(dx) < math.abs(dy) * 0.3 then
+            mon.write("|")
+        elseif (dx > 0) == (dy > 0) then
+            mon.write("\\")
+        else
+            mon.write("/")
+        end
+    end
+end
+
 local function render_main_monitor()
     if not monitor then return end
 
@@ -810,16 +965,23 @@ local function render_main_monitor()
     monitor.setBackgroundColor(colors.black)
     monitor.clear()
 
-    -- Title + SCHED + SETUP buttons
+    -- Title + MAP + SCHED + SETUP buttons
     monitor.setCursorPos(1, 1)
     monitor.setTextColor(colors.cyan)
     local title = station_config.label
     if station_config.is_hub then title = "[HUB] " .. title end
     local setup_lbl = "[SETUP]"
     local sched_lbl = "[SCHED]"
-    monitor.write(title:sub(1, mw - #setup_lbl - #sched_lbl - 1))
+    local map_lbl = "[MAP]"
+    monitor.write(title:sub(1, mw - #setup_lbl - #sched_lbl - #map_lbl - 2))
 
-    local sched_x = mw - #setup_lbl - #sched_lbl
+    local map_x = mw - #setup_lbl - #sched_lbl - #map_lbl
+    monitor.setCursorPos(map_x, 1)
+    monitor.setBackgroundColor(colors.green)
+    monitor.setTextColor(colors.white)
+    monitor.write(map_lbl)
+
+    local sched_x = map_x + #map_lbl
     monitor.setCursorPos(sched_x, 1)
     monitor.setBackgroundColor(colors.purple)
     monitor.setTextColor(colors.white)
@@ -830,6 +992,7 @@ local function render_main_monitor()
     monitor.setTextColor(colors.white)
     monitor.write(setup_lbl)
     monitor.setBackgroundColor(colors.black)
+    mon_btn(1, 1, "open_map", {x1 = map_x, x2 = map_x + #map_lbl - 1})
     mon_btn(1, 1, "open_schedules", {x1 = sched_x, x2 = sched_x + #sched_lbl - 1})
     mon_btn(1, 1, "open_config", {x1 = mw - #setup_lbl + 1, x2 = mw})
 
@@ -2159,6 +2322,234 @@ local function render_sched_confirm_delete()
     monitor.setBackgroundColor(colors.black)
 end
 
+local function render_map()
+    if not monitor then return end
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    -- Title bar
+    monitor.setCursorPos(1, 1)
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(colors.white)
+    monitor.write("< BACK")
+    local title = "NETWORK MAP"
+    monitor.setCursorPos(math.floor((mw - #title) / 2) + 1, 1)
+    monitor.setTextColor(colors.cyan)
+    monitor.write(title)
+    for x = 7, mw do
+        if x < math.floor((mw - #title) / 2) + 1 or x > math.floor((mw - #title) / 2) + #title then
+            monitor.setCursorPos(x, 1)
+            monitor.setTextColor(colors.gray)
+            monitor.write(" ")
+        end
+    end
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(1, 1, "map_back", {x1 = 1, x2 = 6})
+
+    -- Status bar
+    monitor.setCursorPos(1, 2)
+    if not map_data or not map_data.stations then
+        monitor.setTextColor(colors.orange)
+        monitor.write(" Loading...")
+        return
+    end
+
+    local st_count, online_count, train_count = 0, 0, 0
+    for _, st in pairs(map_data.stations) do
+        st_count = st_count + 1
+        if st.online then online_count = online_count + 1 end
+        if st.has_train then train_count = train_count + 1 end
+    end
+    monitor.setTextColor(colors.lightGray)
+    local status = string.format(" %d stations  %d online  %d trains", st_count, online_count, train_count)
+    if map_data.bay_summary and map_data.bay_summary.total > 0 then
+        status = status .. string.format("  Bays:%d/%d", map_data.bay_summary.occupied, map_data.bay_summary.total)
+    end
+    monitor.write(status:sub(1, mw))
+
+    -- Map area
+    local layout = compute_map_layout(map_data.stations, map_data.hub_id, mw, mh)
+
+    -- Find hub node for drawing lines
+    local hub_node = nil
+    for _, node in ipairs(layout) do
+        if node.st.is_hub then hub_node = node; break end
+    end
+
+    -- Draw connection lines from hub to each station
+    if hub_node then
+        for _, node in ipairs(layout) do
+            if node.id ~= hub_node.id then
+                draw_map_line(monitor, hub_node.cx, hub_node.cy, node.cx, node.cy, colors.gray)
+            end
+        end
+    end
+
+    -- Draw station markers on top
+    for _, node in ipairs(layout) do
+        local st = node.st
+        local marker_color
+        if not st.online then
+            marker_color = colors.red
+        elseif st.is_hub then
+            marker_color = colors.yellow
+        elseif st.has_train then
+            marker_color = colors.lime
+        else
+            marker_color = colors.lightBlue
+        end
+
+        monitor.setCursorPos(node.cx, node.cy)
+        monitor.setTextColor(marker_color)
+        monitor.write(st.is_hub and "\4" or "\7")
+
+        -- Short label next to marker
+        local short = (st.label or "?"):sub(1, 8)
+        local lx = node.cx + 2
+        if lx + #short - 1 > mw then lx = node.cx - #short - 1 end
+        if lx >= 1 and lx + #short - 1 <= mw then
+            monitor.setCursorPos(lx, node.cy)
+            monitor.setTextColor(st.is_hub and colors.yellow or colors.white)
+            monitor.write(short)
+        end
+
+        mon_btn(node.cy, node.cy, "map_select_station", {
+            id = node.id,
+            x1 = math.max(1, node.cx - 1),
+            x2 = math.min(mw, node.cx + #short + 2),
+        })
+    end
+
+    -- Bottom: en-route or legend
+    monitor.setCursorPos(1, mh)
+    if train_enroute then
+        monitor.setTextColor(colors.orange)
+        monitor.write(string.format(" \16 %s > %s", train_enroute.from_label:sub(1, 12), train_enroute.to_label:sub(1, 12)))
+    else
+        monitor.setTextColor(colors.yellow)
+        monitor.write("\4")
+        monitor.write("Hub ")
+        monitor.setTextColor(colors.lime)
+        monitor.write("\7")
+        monitor.write("Train ")
+        monitor.setTextColor(colors.lightBlue)
+        monitor.write("\7")
+        monitor.write("Empty ")
+        monitor.setTextColor(colors.red)
+        monitor.write("\7")
+        monitor.write("Off")
+    end
+end
+
+local function render_map_detail()
+    if not monitor or not map_data then return end
+    local mw, mh = monitor.getSize()
+
+    -- Render map underneath first
+    render_map()
+
+    local sid = map_selected_station
+    local st = map_data.stations and map_data.stations[sid]
+    if not st then
+        map_selected_station = nil
+        return
+    end
+
+    -- Detail overlay on bottom rows
+    local detail_h = math.min(7, mh - 3)
+    local dy = mh - detail_h + 1
+
+    for y = dy, mh do
+        monitor.setCursorPos(1, y)
+        monitor.setBackgroundColor(colors.gray)
+        monitor.write(string.rep(" ", mw))
+    end
+
+    -- Close button
+    monitor.setCursorPos(mw - 2, dy)
+    monitor.setBackgroundColor(colors.red)
+    monitor.setTextColor(colors.white)
+    monitor.write("[X]")
+    mon_btn(dy, dy, "map_close_detail", {x1 = mw - 2, x2 = mw})
+
+    -- Station name
+    monitor.setCursorPos(1, dy)
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(st.is_hub and colors.yellow or colors.cyan)
+    local name = (st.is_hub and "[HUB] " or "") .. (st.label or "?")
+    monitor.write(name:sub(1, mw - 4))
+
+    -- Status
+    local cy = dy + 1
+    monitor.setCursorPos(1, cy)
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(st.online and colors.lime or colors.red)
+    monitor.write(st.online and "Online" or "Offline")
+    monitor.setTextColor(colors.white)
+    monitor.write("  Train: ")
+    monitor.setTextColor(st.has_train and colors.lime or colors.lightGray)
+    monitor.write(st.has_train and "YES" or "NO")
+
+    -- Coordinates
+    cy = cy + 1
+    monitor.setCursorPos(1, cy)
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(colors.lightGray)
+    monitor.write(string.format("Pos: %d, %d, %d", st.x or 0, st.y or 0, st.z or 0))
+
+    -- Trip stats
+    cy = cy + 1
+    monitor.setCursorPos(1, cy)
+    monitor.setBackgroundColor(colors.gray)
+    local stats = map_data.trip_stats and map_data.trip_stats[sid]
+    if stats and stats.avg_duration_ms then
+        local avg_sec = math.floor(stats.avg_duration_ms / 1000)
+        monitor.setTextColor(colors.white)
+        monitor.write("Avg trip: ")
+        monitor.setTextColor(colors.yellow)
+        if avg_sec < 60 then
+            monitor.write(avg_sec .. "s")
+        else
+            monitor.write(math.floor(avg_sec / 60) .. "m " .. (avg_sec % 60) .. "s")
+        end
+        monitor.setTextColor(colors.lightGray)
+        monitor.write(" (" .. (stats.trip_count or 0) .. " trips)")
+    else
+        monitor.setTextColor(colors.lightGray)
+        monitor.write("No trip data")
+    end
+
+    -- Last trip
+    if stats and stats.last_trip_time then
+        cy = cy + 1
+        monitor.setCursorPos(1, cy)
+        monitor.setBackgroundColor(colors.gray)
+        monitor.setTextColor(colors.lightGray)
+        local ago = math.floor((os.epoch("utc") - stats.last_trip_time) / 1000)
+        local ago_str
+        if ago < 60 then ago_str = ago .. "s ago"
+        elseif ago < 3600 then ago_str = math.floor(ago / 60) .. "m ago"
+        else ago_str = math.floor(ago / 3600) .. "h ago" end
+        monitor.write("Last trip: " .. ago_str)
+    end
+
+    -- GO TO button (not for self)
+    if sid ~= os.getComputerID() then
+        cy = cy + 1
+        if cy <= mh then
+            local go_lbl = " GO TO "
+            local go_x = math.floor((mw - #go_lbl) / 2) + 1
+            monitor.setCursorPos(go_x, cy)
+            monitor.setBackgroundColor(colors.blue)
+            monitor.setTextColor(colors.white)
+            monitor.write(go_lbl)
+            mon_btn(cy, cy, "dispatch_to", {id = sid, label = st.label, x1 = go_x, x2 = go_x + #go_lbl - 1})
+        end
+    end
+    monitor.setBackgroundColor(colors.black)
+end
+
 local function render_monitor()
     if not monitor then return end
     monitor_buttons = {}
@@ -2193,6 +2584,10 @@ local function render_monitor()
         render_sched_detail()
     elseif monitor_mode == "sched_confirm_delete" then
         render_sched_confirm_delete()
+    elseif monitor_mode == "map" then
+        render_map()
+    elseif monitor_mode == "map_detail" then
+        render_map_detail()
     else
         render_main_monitor()
     end
@@ -2627,6 +3022,22 @@ local function command_listener()
                     set_sched_status("ERR: " .. (msg.message or "?"))
                     render_monitor()
 
+                -- Network map data response
+                elseif msg.action == "network_status" then
+                    if station_config.is_hub and map_data then
+                        -- Hub: merge trip_stats from Wraith into local map_data
+                        map_data.trip_stats = msg.trip_stats or {}
+                        if msg.bay_summary then map_data.bay_summary = msg.bay_summary end
+                    else
+                        map_data = {
+                            stations = msg.stations or {},
+                            hub_id = msg.hub_id,
+                            bay_summary = msg.bay_summary or {total = 0, occupied = 0},
+                            trip_stats = msg.trip_stats or {},
+                        }
+                    end
+                    render_monitor()
+
                 elseif msg.action == "request_dispatch" and station_config.is_hub then
                     -- Remote station is sending a train TO hub — set switches OFF for inbound
                     if msg.to == os.getComputerID() then
@@ -2935,6 +3346,11 @@ end
 
 local function monitor_loop()
     while true do
+        -- Auto-refresh map data when viewing map
+        if (monitor_mode == "map" or monitor_mode == "map_detail")
+            and (os.clock() - map_last_fetch) > MAP_FETCH_INTERVAL then
+            map_fetch_data()
+        end
         render_monitor()
         os.sleep(1)
     end
@@ -3280,6 +3696,32 @@ local function monitor_touch_loop()
                     scan_integrators()
                     scan_player_detectors()
                     print("Rescanned: " .. #redstone_integrators .. " integrators, " .. #player_detectors .. " player detectors")
+                    render_monitor()
+
+                -- ==============================
+                -- Map actions
+                -- ==============================
+                elseif btn.action == "open_map" then
+                    map_selected_station = nil
+                    map_fetch_data()
+                    monitor_mode = "map"
+                    render_monitor()
+
+                elseif btn.action == "map_back" then
+                    monitor_mode = "main"
+                    map_selected_station = nil
+                    render_monitor()
+
+                elseif btn.action == "map_select_station" then
+                    if btn.data and btn.data.id then
+                        map_selected_station = btn.data.id
+                        monitor_mode = "map_detail"
+                        render_monitor()
+                    end
+
+                elseif btn.action == "map_close_detail" then
+                    map_selected_station = nil
+                    monitor_mode = "map"
                     render_monitor()
 
                 -- ==============================
