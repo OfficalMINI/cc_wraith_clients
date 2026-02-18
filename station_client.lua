@@ -2539,10 +2539,10 @@ local function command_listener()
                     end
 
                 elseif msg.action == "request_train" then
-                    -- Remote station requesting a train — send direct from bay (bypass hub)
-                    if station_config.is_hub and not switches_locked and not pending_outbound then
-                        local target_id = msg.station_id or sender
-                        local target_label = msg.label or ("Station #" .. sender)
+                    -- Transport service or remote station requesting a train
+                    if station_config.is_hub and not switches_locked and not pending_outbound and not pending_destination then
+                        local target_id = msg.target or msg.station_id or sender
+                        local target_label = msg.target_label or msg.label or ("Station #" .. target_id)
                         local bay_idx = nil
                         for i, sw in ipairs(station_config.switches) do
                             if sw.parking then
@@ -2554,19 +2554,31 @@ local function command_listener()
                             end
                         end
                         if bay_idx then
-                            -- ALL switches ON — train exits bay directly to destination (bypasses hub)
-                            for i, sw in ipairs(station_config.switches) do
-                                if sw.parking then
-                                    set_switch(i, true)
+                            if msg.trip_type == "delivery" then
+                                -- Delivery: train must visit hub first to load items from buffer
+                                -- Pull train from bay to hub, then dispatch onward to destination
+                                pending_outbound = {station_id = target_id, label = target_label}
+                                for i, sw in ipairs(station_config.switches) do
+                                    if sw.parking then
+                                        set_switch(i, i ~= bay_idx)
+                                    end
                                 end
+                                print("[hub] Pulling bay " .. bay_idx .. " to hub for delivery -> " .. target_label)
+                                dispatch_from_bay(bay_idx)
+                            else
+                                -- Collection/other: send empty train direct from bay to destination
+                                for i, sw in ipairs(station_config.switches) do
+                                    if sw.parking then
+                                        set_switch(i, true)
+                                    end
+                                end
+                                switches_locked = true
+                                switches_locked_for = target_id
+                                switches_locked_time = os.clock()
+                                train_enroute = {from_label = station_config.label, to_label = target_label}
+                                print("[hub] Direct dispatch bay " .. bay_idx .. " -> " .. target_label)
+                                dispatch_from_bay(bay_idx)
                             end
-                            -- Lock immediately — train is going direct to destination
-                            switches_locked = true
-                            switches_locked_for = target_id
-                            switches_locked_time = os.clock()
-                            train_enroute = {from_label = station_config.label, to_label = target_label}
-                            print("[hub] Direct dispatch bay " .. bay_idx .. " -> " .. target_label)
-                            dispatch_from_bay(bay_idx)
                         else
                             print("[hub] No trains available for " .. target_label)
                             rednet.send(sender, {action = "train_unavailable"}, PROTOCOLS.command)
