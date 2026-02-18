@@ -739,7 +739,7 @@ check_detector()
 local route_data = nil   -- station list from hub (for remote stations)
 
 -- Monitor UI state
-local monitor_mode = "main"  -- "main", "config", "pick_integrator", "pick_face", "switch_face", "switch_parking", "pick_player_det", "pick_buffer_chest", "edit_switch"
+local monitor_mode = "main"  -- "main", "config", "pick_integrator", "pick_face", "switch_face", "switch_parking", "pick_player_det", "pick_buffer_chest", "edit_switch", "schedules", "sched_new_type", "sched_pick_station", "sched_pick_items", "sched_set_amounts", "sched_pick_period", "sched_detail", "sched_confirm_delete"
 local config_purpose = nil   -- "rail", "detector", "switch", "bay_detector", "bay_rail", "edit_sw_integrator", "edit_sw_bay_detector", "edit_sw_bay_rail"
 local pending_switch = nil   -- temp switch being built
 local editing_switch_idx = nil  -- index of switch being edited (nil = adding new)
@@ -782,6 +782,7 @@ end
 local function sched_send(msg)
     if not WRAITH_ID then return end
     msg.station_id = os.getComputerID()
+    if station_config.is_hub then msg.all = true end
     rednet.send(WRAITH_ID, msg, PROTOCOLS.command)
 end
 
@@ -1769,16 +1770,19 @@ local function render_schedules()
         local icon = (s.type == "delivery") and ">" or "<"
         local typ = (s.type == "delivery") and "DELIV" or "COLCT"
         local per = format_period(s.period)
-        local items_txt = ""
-        if s.type == "delivery" and s.items then
-            items_txt = #s.items .. " item" .. (#s.items ~= 1 and "s" or "")
+        local detail = ""
+        if s.target_label then
+            -- Hub view: show target station name
+            detail = s.target_label:sub(1, 10)
+        elseif s.type == "delivery" and s.items then
+            detail = #s.items .. " item" .. (#s.items ~= 1 and "s" or "")
         end
         local status = s.enabled and "ON" or "OFF"
         local status_col = s.enabled and colors.lime or colors.red
 
         monitor.setCursorPos(1, y)
         monitor.setTextColor(colors.white)
-        monitor.write(string.format(" %s %-5s %-6s %-8s", icon, typ, per, items_txt))
+        monitor.write(string.format(" %s %-5s %-6s %-10s", icon, typ, per, detail))
         monitor.setTextColor(status_col)
         local sx = mw - 6
         monitor.setCursorPos(sx, y)
@@ -1816,6 +1820,9 @@ local function render_sched_new_type()
     monitor.setTextColor(colors.lightGray)
     monitor.write(" Select type:")
 
+    local d_desc = station_config.is_hub and "Send items to station" or "Send items here"
+    local c_desc = station_config.is_hub and "Collect from station" or "Pick up items"
+
     -- Delivery button
     local y = 6
     monitor.setCursorPos(2, y)
@@ -1826,7 +1833,7 @@ local function render_sched_new_type()
     monitor.setBackgroundColor(colors.black)
     monitor.setCursorPos(2 + #dlbl + 1, y)
     monitor.setTextColor(colors.lightGray)
-    monitor.write("Send items here")
+    monitor.write(d_desc)
     mon_btn(y, y, "sched_type_delivery", {x1 = 2, x2 = 2 + #dlbl - 1})
 
     -- Collection button
@@ -1839,8 +1846,47 @@ local function render_sched_new_type()
     monitor.setBackgroundColor(colors.black)
     monitor.setCursorPos(2 + #clbl + 1, y)
     monitor.setTextColor(colors.lightGray)
-    monitor.write("Pick up items")
+    monitor.write(c_desc)
     mon_btn(y, y, "sched_type_collection", {x1 = 2, x2 = 2 + #clbl - 1})
+end
+
+local function render_sched_pick_station()
+    if not monitor then return end
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    render_sched_header("SELECT STATION", mw, false)
+
+    monitor.setCursorPos(1, 4)
+    monitor.setTextColor(colors.lightGray)
+    local hint = new_schedule and new_schedule.type == "delivery" and " Deliver items to:" or " Collect items from:"
+    monitor.write(hint)
+
+    local sorted = {}
+    for id, st in pairs(connected_stations) do
+        table.insert(sorted, {id = id, label = st.label or ("Station #" .. id)})
+    end
+    table.sort(sorted, function(a, b) return a.label < b.label end)
+
+    local y = 6
+    for _, st in ipairs(sorted) do
+        if y > mh - 1 then break end
+        monitor.setCursorPos(2, y)
+        monitor.setBackgroundColor(colors.blue)
+        monitor.setTextColor(colors.white)
+        local btn_text = " " .. st.label:sub(1, mw - 4) .. string.rep(" ", math.max(0, mw - 4 - #st.label))
+        monitor.write(btn_text)
+        monitor.setBackgroundColor(colors.black)
+        mon_btn(y, y, "sched_pick_station_select", {id = st.id, label = st.label, x1 = 2, x2 = mw - 1})
+        y = y + 2
+    end
+
+    if #sorted == 0 then
+        monitor.setCursorPos(2, 6)
+        monitor.setTextColor(colors.gray)
+        monitor.write("No stations connected")
+    end
 end
 
 local function render_sched_pick_items()
@@ -1989,6 +2035,16 @@ local function render_sched_detail()
 
     local y = 3
 
+    -- Target station (hub view only)
+    if sched.target_label then
+        monitor.setCursorPos(1, y)
+        monitor.setTextColor(colors.lightGray)
+        monitor.write(" To: ")
+        monitor.setTextColor(colors.cyan)
+        monitor.write(sched.target_label)
+        y = y + 1
+    end
+
     -- Period
     monitor.setCursorPos(1, y)
     monitor.setTextColor(colors.lightGray)
@@ -2125,6 +2181,8 @@ local function render_monitor()
         render_schedules()
     elseif monitor_mode == "sched_new_type" then
         render_sched_new_type()
+    elseif monitor_mode == "sched_pick_station" then
+        render_sched_pick_station()
     elseif monitor_mode == "sched_pick_items" then
         render_sched_pick_items()
     elseif monitor_mode == "sched_set_amounts" then
@@ -3225,18 +3283,28 @@ local function monitor_touch_loop()
                     if monitor_mode == "sched_new_type" then
                         new_schedule = nil
                         monitor_mode = "schedules"
-                    elseif monitor_mode == "sched_pick_items" then
+                    elseif monitor_mode == "sched_pick_station" then
                         monitor_mode = "sched_new_type"
+                    elseif monitor_mode == "sched_pick_items" then
+                        if station_config.is_hub then
+                            monitor_mode = "sched_pick_station"
+                        else
+                            monitor_mode = "sched_new_type"
+                        end
                     elseif monitor_mode == "sched_set_amounts" then
                         monitor_mode = "sched_pick_items"
                     elseif monitor_mode == "sched_pick_period" then
-                        if new_schedule and new_schedule.type == "collection" then
-                            monitor_mode = "sched_new_type"
-                        elseif new_schedule then
-                            monitor_mode = "sched_set_amounts"
-                        else
+                        if not new_schedule then
                             -- Changing period on existing schedule — go back to detail
                             monitor_mode = "sched_detail"
+                        elseif new_schedule.type == "collection" then
+                            if station_config.is_hub then
+                                monitor_mode = "sched_pick_station"
+                            else
+                                monitor_mode = "sched_new_type"
+                            end
+                        else
+                            monitor_mode = "sched_set_amounts"
                         end
                     elseif monitor_mode == "sched_detail" then
                         monitor_mode = "schedules"
@@ -3256,13 +3324,33 @@ local function monitor_touch_loop()
                 elseif btn.action == "sched_type_delivery" then
                     new_schedule.type = "delivery"
                     sched_item_scroll = 0
-                    monitor_mode = "sched_pick_items"
+                    if station_config.is_hub then
+                        monitor_mode = "sched_pick_station"
+                    else
+                        monitor_mode = "sched_pick_items"
+                    end
                     render_monitor()
 
                 elseif btn.action == "sched_type_collection" then
                     new_schedule.type = "collection"
-                    monitor_mode = "sched_pick_period"
+                    if station_config.is_hub then
+                        monitor_mode = "sched_pick_station"
+                    else
+                        monitor_mode = "sched_pick_period"
+                    end
                     render_monitor()
+
+                elseif btn.action == "sched_pick_station_select" then
+                    if new_schedule and btn.data then
+                        new_schedule.target_id = btn.data.id
+                        new_schedule.target_label = btn.data.label
+                        if new_schedule.type == "delivery" then
+                            monitor_mode = "sched_pick_items"
+                        else
+                            monitor_mode = "sched_pick_period"
+                        end
+                        render_monitor()
+                    end
 
                 elseif btn.action == "sched_toggle_item" then
                     if new_schedule and btn.data and btn.data.item then
@@ -3313,7 +3401,7 @@ local function monitor_touch_loop()
                     if new_schedule then
                         -- Creating new schedule
                         new_schedule.period = btn.data.seconds
-                        sched_send({
+                        local cmd = {
                             action = "add_schedule",
                             schedule = {
                                 type = new_schedule.type,
@@ -3321,13 +3409,24 @@ local function monitor_touch_loop()
                                 amounts = new_schedule.amounts,
                                 period = new_schedule.period,
                             },
-                        })
+                        }
+                        if new_schedule.target_id then
+                            cmd.target_id = new_schedule.target_id
+                        end
+                        sched_send(cmd)
                         set_sched_status("Saving...")
                         new_schedule = nil
                         monitor_mode = "schedules"
                     else
                         -- Updating period on existing schedule
-                        sched_send({action = "update_schedule", idx = sched_detail_idx, field = "period", value = btn.data.seconds})
+                        local cmd = {action = "update_schedule", idx = sched_detail_idx, field = "period", value = btn.data.seconds}
+                        -- Hub: include target_id from cached schedule
+                        if station_config.is_hub and cached_schedules[sched_detail_idx] then
+                            local s = cached_schedules[sched_detail_idx]
+                            cmd.target_id = s.target_id
+                            cmd.idx = s.orig_idx or sched_detail_idx
+                        end
+                        sched_send(cmd)
                         set_sched_status("Saving...")
                         monitor_mode = "sched_detail"
                     end
@@ -3341,15 +3440,21 @@ local function monitor_touch_loop()
                     end
 
                 elseif btn.action == "sched_toggle_detail" then
-                    if sched_detail_idx then
-                        sched_send({action = "toggle_schedule", idx = sched_detail_idx})
+                    if sched_detail_idx and cached_schedules[sched_detail_idx] then
+                        local s = cached_schedules[sched_detail_idx]
+                        local cmd = {action = "toggle_schedule", idx = s.orig_idx or sched_detail_idx}
+                        if s.target_id then cmd.target_id = s.target_id end
+                        sched_send(cmd)
                         set_sched_status("Toggling...")
                         render_monitor()
                     end
 
                 elseif btn.action == "sched_run_now" then
-                    if btn.data and btn.data.idx then
-                        sched_send({action = "run_schedule", idx = btn.data.idx})
+                    if btn.data and btn.data.idx and cached_schedules[btn.data.idx] then
+                        local s = cached_schedules[btn.data.idx]
+                        local cmd = {action = "run_schedule", idx = s.orig_idx or btn.data.idx}
+                        if s.target_id then cmd.target_id = s.target_id end
+                        sched_send(cmd)
                         set_sched_status("Running...")
                         render_monitor()
                     end
@@ -3365,8 +3470,11 @@ local function monitor_touch_loop()
                     render_monitor()
 
                 elseif btn.action == "sched_delete_confirm" then
-                    if sched_detail_idx then
-                        sched_send({action = "remove_schedule", idx = sched_detail_idx})
+                    if sched_detail_idx and cached_schedules[sched_detail_idx] then
+                        local s = cached_schedules[sched_detail_idx]
+                        local cmd = {action = "remove_schedule", idx = s.orig_idx or sched_detail_idx}
+                        if s.target_id then cmd.target_id = s.target_id end
+                        sched_send(cmd)
                         set_sched_status("Deleting...")
                     end
                     sched_detail_idx = nil
