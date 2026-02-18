@@ -63,6 +63,7 @@ local station_config = {
     detector_face = "top",      -- face on the integrator for detector rail input
     switches = {},             -- {{peripheral_name, face, description, routes, parking, bay_*}, ...}
     player_detector = nil,     -- peripheral name of player detector block
+    buffer_chest = nil,        -- peripheral name of trapped chest for logistics buffer (hub only)
     rules = {},                -- automation rules
 }
 
@@ -736,7 +737,7 @@ check_detector()
 local route_data = nil   -- station list from hub (for remote stations)
 
 -- Monitor UI state
-local monitor_mode = "main"  -- "main", "config", "pick_integrator", "pick_face", "switch_face", "switch_parking", "pick_player_det", "edit_switch"
+local monitor_mode = "main"  -- "main", "config", "pick_integrator", "pick_face", "switch_face", "switch_parking", "pick_player_det", "pick_buffer_chest", "edit_switch"
 local config_purpose = nil   -- "rail", "detector", "switch", "bay_detector", "bay_rail", "edit_sw_integrator", "edit_sw_bay_detector", "edit_sw_bay_rail"
 local pending_switch = nil   -- temp switch being built
 local editing_switch_idx = nil  -- index of switch being edited (nil = adding new)
@@ -1207,6 +1208,41 @@ local function render_config_monitor()
         cy = cy + 1
     end
 
+    -- Buffer Chest (Hub only)
+    if station_config.is_hub then
+        cy = cy + 1
+        if cy <= mh then
+            monitor.setCursorPos(1, cy)
+            monitor.setTextColor(colors.white)
+            monitor.write("Buffer Chest:")
+            cy = cy + 1
+            if cy <= mh then
+                monitor.setCursorPos(2, cy)
+                if station_config.buffer_chest then
+                    monitor.setTextColor(colors.yellow)
+                    monitor.write(station_config.buffer_chest:sub(1, mw - 12))
+                    monitor.setCursorPos(mw - 2, cy)
+                    monitor.setBackgroundColor(colors.red)
+                    monitor.setTextColor(colors.white)
+                    monitor.write("[X]")
+                    monitor.setBackgroundColor(colors.black)
+                    mon_btn(cy, cy, "remove_buffer", {x1 = mw - 2, x2 = mw})
+                else
+                    monitor.setTextColor(colors.gray)
+                    monitor.write("NONE")
+                    local set_lbl = "[SET]"
+                    monitor.setCursorPos(mw - #set_lbl + 1, cy)
+                    monitor.setBackgroundColor(colors.blue)
+                    monitor.setTextColor(colors.white)
+                    monitor.write(set_lbl)
+                    monitor.setBackgroundColor(colors.black)
+                    mon_btn(cy, cy, "pick_buffer", {x1 = mw - #set_lbl + 1, x2 = mw})
+                end
+            end
+            cy = cy + 1
+        end
+    end
+
     -- Rescan
     cy = cy + 1
     if cy <= mh then
@@ -1545,6 +1581,62 @@ local function render_player_detector_picker()
     end
 end
 
+local function render_buffer_chest_picker()
+    if not monitor then return end
+
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    monitor.setCursorPos(1, 1)
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(colors.white)
+    monitor.write("< BACK")
+    monitor.setBackgroundColor(colors.black)
+    mon_btn(1, 1, "back_to_config", {x1 = 1, x2 = 6})
+
+    monitor.setCursorPos(1, 2)
+    monitor.setTextColor(colors.cyan)
+    monitor.write("SELECT BUFFER CHEST")
+
+    monitor.setCursorPos(1, 3)
+    monitor.setTextColor(colors.gray)
+    monitor.write(string.rep("-", mw))
+
+    -- Find trapped chests on the wired network
+    local trapped = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        local ok, ptype = pcall(peripheral.getType, name)
+        if ok and ptype == "minecraft:trapped_chest" then
+            table.insert(trapped, name)
+        end
+    end
+
+    local cy = 4
+    if #trapped == 0 then
+        monitor.setCursorPos(2, cy)
+        monitor.setTextColor(colors.red)
+        monitor.write("No trapped chests found!")
+    else
+        for i, name in ipairs(trapped) do
+            if cy > mh then break end
+            local is_current = (name == station_config.buffer_chest)
+            monitor.setCursorPos(1, cy)
+            if is_current then
+                monitor.setBackgroundColor(colors.blue)
+            else
+                monitor.setBackgroundColor(colors.gray)
+            end
+            monitor.setTextColor(colors.white)
+            local entry = string.format(" %d. %s %s", i, name:sub(1, mw - 8), is_current and "*" or " ")
+            monitor.write(entry .. string.rep(" ", math.max(0, mw - #entry)))
+            monitor.setBackgroundColor(colors.black)
+            mon_btn(cy, cy, "select_buffer", {name = name})
+            cy = cy + 1
+        end
+    end
+end
+
 local function render_monitor()
     if not monitor then return end
     monitor_buttons = {}
@@ -1561,6 +1653,8 @@ local function render_monitor()
         render_edit_switch()
     elseif monitor_mode == "pick_player_det" then
         render_player_detector_picker()
+    elseif monitor_mode == "pick_buffer_chest" then
+        render_buffer_chest_picker()
     else
         render_main_monitor()
     end
@@ -2500,6 +2594,23 @@ local function monitor_touch_loop()
                     players_nearby = false
                     save_config()
                     print("Player detector removed")
+                    render_monitor()
+
+                elseif btn.action == "pick_buffer" then
+                    monitor_mode = "pick_buffer_chest"
+                    render_monitor()
+
+                elseif btn.action == "select_buffer" then
+                    station_config.buffer_chest = btn.data.name
+                    save_config()
+                    print("Buffer chest set: " .. btn.data.name)
+                    monitor_mode = "config"
+                    render_monitor()
+
+                elseif btn.action == "remove_buffer" then
+                    station_config.buffer_chest = nil
+                    save_config()
+                    print("Buffer chest removed")
                     render_monitor()
 
                 elseif btn.action == "rescan" then
