@@ -481,6 +481,7 @@ local switches_locked = false     -- hub: true while train is in transit (switch
 local switches_locked_for = nil   -- hub: destination station id we're waiting on
 local switches_locked_time = 0    -- os.clock() when locked (for safety timeout)
 local SWITCH_LOCK_TIMEOUT = 120   -- max seconds to hold switches locked
+local pending_switch_lock = nil   -- {station_id, label} lock to engage when train departs hub
 
 -- Per-bay state tracking for parking bays
 -- Keyed by switch index: {last_signal, last_toggle_time, has_train}
@@ -649,6 +650,14 @@ local function check_detector()
             else
                 print("[det] >>> TRAIN DEPARTED <<<")
                 os.queueEvent("train_departed")
+                -- Hub: engage switch lock now that train has actually left
+                if station_config.is_hub and pending_switch_lock then
+                    switches_locked = true
+                    switches_locked_for = pending_switch_lock.station_id
+                    switches_locked_time = os.clock()
+                    print("[hub] Switches locked - train en route to " .. (pending_switch_lock.label or "?"))
+                    pending_switch_lock = nil
+                end
             end
             -- Notify hub immediately if remote station
             if HUB_ID and HUB_ID ~= os.getComputerID() then
@@ -1849,10 +1858,7 @@ local function command_listener()
                                     set_switch(i, true)
                                 end
                             end
-                            -- Lock switches for the entire journey (bay -> hub -> destination)
-                            switches_locked = true
-                            switches_locked_for = pending_outbound.station_id
-                            switches_locked_time = os.clock()
+                            -- Don't lock yet — lock after train leaves hub (detector confirms departure)
                             print("[hub] Pulling from bay " .. bay_idx .. " for " .. pending_outbound.label)
                             dispatch_from_bay(bay_idx)
                         else
@@ -1945,17 +1951,12 @@ local function train_arrival_handler()
             pending_outbound = nil
             print("[hub] Train ready, sending to " .. (target.label or "#" .. target.station_id))
 
-            -- Set ALL parking switches to bypass (ON) so train goes past bays to exit
-            for i, sw in ipairs(station_config.switches) do
-                if sw.parking then
-                    set_switch(i, true)
-                end
-            end
-            -- Lock switches until destination confirms arrival
-            switches_locked = true
-            switches_locked_for = target.station_id
-            switches_locked_time = os.clock()
-            print("[hub] Switches locked for transit to " .. (target.label or "#" .. target.station_id))
+            -- Switches already set to bypass from bay pull
+            -- Prepare lock — will engage when hub detector confirms train departed
+            pending_switch_lock = {
+                station_id = target.station_id,
+                label = target.label or ("#" .. target.station_id),
+            }
 
             os.sleep(1)
             if has_train then
@@ -2045,17 +2046,17 @@ local function departure_handler()
 
         if not cancelled and has_train and pending_destination then
             local dest = pending_destination
-            -- Hub: set switches to bypass parking bays and lock them
+            -- Hub: set switches to bypass parking bays, lock when train departs
             if station_config.is_hub then
                 for i, sw in ipairs(station_config.switches) do
                     if sw.parking then
                         set_switch(i, true)
                     end
                 end
-                switches_locked = true
-                switches_locked_for = dest.id
-                switches_locked_time = os.clock()
-                print("[hub] Switches locked for transit to " .. dest.label)
+                pending_switch_lock = {
+                    station_id = dest.id,
+                    label = dest.label,
+                }
             end
             -- Notify hub about outbound dispatch (remote stations)
             if HUB_ID and HUB_ID ~= os.getComputerID() then
@@ -2156,9 +2157,7 @@ local function monitor_touch_loop()
                                             set_switch(i, true)
                                         end
                                     end
-                                    switches_locked = true
-                                    switches_locked_for = pending_destination and pending_destination.id
-                                    switches_locked_time = os.clock()
+                                    -- Don't lock yet — lock after train leaves hub
                                     print("[hub] Pulling from bay " .. bay_idx .. " for departure")
                                     dispatch_from_bay(bay_idx)
                                 else
