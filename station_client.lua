@@ -679,25 +679,10 @@ local function check_detector()
                 print("[det] >>> TRAIN ARRIVED <<<")
                 -- Clear en-route status
                 train_enroute = nil
-                -- Hub: train arrived — unlock switches (inbound train reached hub safely)
-                if station_config.is_hub and (switches_locked or pending_switch_lock) then
-                    switches_locked = false
-                    switches_locked_for = nil
-                    pending_switch_lock = nil
-                    print("[hub] Switches unlocked - train at hub")
-                end
                 os.queueEvent("train_arrived")
             else
                 print("[det] >>> TRAIN DEPARTED <<<")
                 os.queueEvent("train_departed")
-                -- Hub: engage switch lock now that train has actually left
-                if station_config.is_hub and pending_switch_lock then
-                    switches_locked = true
-                    switches_locked_for = pending_switch_lock.station_id
-                    switches_locked_time = os.clock()
-                    print("[hub] Switches locked - train en route to " .. (pending_switch_lock.label or "?"))
-                    pending_switch_lock = nil
-                end
             end
             -- Notify hub immediately if remote station
             if HUB_ID and HUB_ID ~= os.getComputerID() then
@@ -3109,18 +3094,19 @@ local function command_listener()
                     render_monitor()
 
                 elseif msg.action == "request_dispatch" and station_config.is_hub then
-                    -- Remote station is sending a train TO hub — set switches OFF for inbound
+                    -- Remote station is sending a train TO hub — bypass bays so train reaches platform
                     if msg.to == os.getComputerID() then
-                        -- Unlock any existing lock
-                        switches_locked = false
-                        switches_locked_for = nil
+                        -- Clear outbound lock, set inbound lock
                         pending_switch_lock = nil
-                        -- Set all parking switches OFF so train can reach hub
+                        -- Set all parking switches ON (bypass bays) so train reaches hub platform
                         for i, sw in ipairs(station_config.switches) do
                             if sw.parking then
-                                set_switch(i, false)
+                                set_switch(i, true)
                             end
                         end
+                        switches_locked = true
+                        switches_locked_for = msg.from
+                        switches_locked_time = os.clock()
                         local from_lbl = msg.from_label or (msg.from and ("#" .. msg.from) or "?")
                         train_enroute = {from_id = msg.from, to_id = os.getComputerID(), from_label = from_lbl, to_label = station_config.label, started = os.clock()}
                         print("[hub] Inbound train from " .. from_lbl .. " - switches open")
@@ -3232,16 +3218,15 @@ local function train_arrival_handler()
             print("[hub] Train ready, sending to " .. (target.label or "#" .. target.station_id))
 
             -- Train is now at hub — set ALL switches to bypass (ON) for outbound
+            -- Lock immediately so switches stay until destination confirms arrival
             for i, sw in ipairs(station_config.switches) do
                 if sw.parking then
                     set_switch(i, true)
                 end
             end
-            -- Prepare lock — will engage when hub detector confirms train departed
-            pending_switch_lock = {
-                station_id = target.station_id,
-                label = target.label or ("#" .. target.station_id),
-            }
+            switches_locked = true
+            switches_locked_for = target.station_id
+            switches_locked_time = os.clock()
 
             train_enroute = {from_id = os.getComputerID(), to_id = target.station_id, from_label = station_config.label, to_label = target.label or ("#" .. target.station_id), started = os.clock()}
             os.sleep(1)
@@ -3254,6 +3239,11 @@ local function train_arrival_handler()
             os.queueEvent("departure_start")
 
         elseif station_config.is_hub then
+            -- Hub: inbound complete — unlock switches for parking
+            switches_locked = false
+            switches_locked_for = nil
+            pending_switch_lock = nil
+            print("[hub] Switches unlocked - train at hub")
             -- Hub: no pending jobs, auto-park after delay
             print("[auto-park] Train arrived, waiting " .. AUTO_PARK_DELAY .. "s...")
             local park_timer = os.startTimer(AUTO_PARK_DELAY)
@@ -3384,17 +3374,16 @@ local function departure_handler()
 
         if not cancelled and has_train and pending_destination then
             local dest = pending_destination
-            -- Hub: set switches to bypass parking bays, lock when train departs
+            -- Hub: set switches to bypass parking bays, lock until destination confirms
             if station_config.is_hub then
                 for i, sw in ipairs(station_config.switches) do
                     if sw.parking then
                         set_switch(i, true)
                     end
                 end
-                pending_switch_lock = {
-                    station_id = dest.id,
-                    label = dest.label,
-                }
+                switches_locked = true
+                switches_locked_for = dest.id
+                switches_locked_time = os.clock()
             end
             -- Notify hub about outbound dispatch (remote stations)
             if HUB_ID and HUB_ID ~= os.getComputerID() then
