@@ -1842,11 +1842,17 @@ local function command_listener()
                             end
                         end
                         if bay_idx then
+                            -- Set ALL parking switches to ON (bypass) so train exits
+                            -- bay and goes to hub main track, not back into another bay
                             for i, sw in ipairs(station_config.switches) do
                                 if sw.parking then
-                                    set_switch(i, i ~= bay_idx)
+                                    set_switch(i, true)
                                 end
                             end
+                            -- Lock switches for the entire journey (bay -> hub -> destination)
+                            switches_locked = true
+                            switches_locked_for = pending_outbound.station_id
+                            switches_locked_time = os.clock()
                             print("[hub] Pulling from bay " .. bay_idx .. " for " .. pending_outbound.label)
                             dispatch_from_bay(bay_idx)
                         else
@@ -2144,11 +2150,15 @@ local function monitor_touch_loop()
                                     end
                                 end
                                 if bay_idx then
+                                    -- Set ALL parking switches to ON (bypass) so train exits bay
                                     for i, sw in ipairs(station_config.switches) do
                                         if sw.parking then
-                                            set_switch(i, i ~= bay_idx)
+                                            set_switch(i, true)
                                         end
                                     end
+                                    switches_locked = true
+                                    switches_locked_for = pending_destination and pending_destination.id
+                                    switches_locked_time = os.clock()
                                     print("[hub] Pulling from bay " .. bay_idx .. " for departure")
                                     dispatch_from_bay(bay_idx)
                                 else
