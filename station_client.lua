@@ -646,6 +646,13 @@ local function check_detector()
             last_toggle_time = now
             if has_train then
                 print("[det] >>> TRAIN ARRIVED <<<")
+                -- Hub: train arrived — unlock switches (inbound train reached hub safely)
+                if station_config.is_hub and (switches_locked or pending_switch_lock) then
+                    switches_locked = false
+                    switches_locked_for = nil
+                    pending_switch_lock = nil
+                    print("[hub] Switches unlocked - train at hub")
+                end
                 os.queueEvent("train_arrived")
             else
                 print("[det] >>> TRAIN DEPARTED <<<")
@@ -1834,12 +1841,10 @@ local function command_listener()
                     end
 
                 elseif msg.action == "request_train" then
-                    -- Remote station requesting a train (hub only)
-                    if station_config.is_hub and not pending_outbound and not pending_destination then
-                        pending_outbound = {
-                            station_id = msg.station_id or sender,
-                            label = msg.label or ("Station #" .. sender),
-                        }
+                    -- Remote station requesting a train — send direct from bay (bypass hub)
+                    if station_config.is_hub and not switches_locked and not pending_outbound then
+                        local target_id = msg.station_id or sender
+                        local target_label = msg.label or ("Station #" .. sender)
                         local bay_idx = nil
                         for i, sw in ipairs(station_config.switches) do
                             if sw.parking then
@@ -1851,18 +1856,21 @@ local function command_listener()
                             end
                         end
                         if bay_idx then
-                            -- Target bay switch OFF (open path out), others ON (block)
+                            -- ALL switches ON — train exits bay directly to destination (bypasses hub)
                             for i, sw in ipairs(station_config.switches) do
                                 if sw.parking then
-                                    set_switch(i, i ~= bay_idx)
+                                    set_switch(i, true)
                                 end
                             end
-                            print("[hub] Pulling from bay " .. bay_idx .. " for " .. pending_outbound.label)
+                            -- Lock immediately — train is going direct to destination
+                            switches_locked = true
+                            switches_locked_for = target_id
+                            switches_locked_time = os.clock()
+                            print("[hub] Direct dispatch bay " .. bay_idx .. " -> " .. target_label)
                             dispatch_from_bay(bay_idx)
                         else
-                            print("[hub] No trains available for " .. pending_outbound.label)
+                            print("[hub] No trains available for " .. target_label)
                             rednet.send(sender, {action = "train_unavailable"}, PROTOCOLS.command)
-                            pending_outbound = nil
                         end
                     elseif station_config.is_hub then
                         -- Hub busy, reject
@@ -1875,6 +1883,22 @@ local function command_listener()
                         print("No trains available at hub")
                         pending_destination = nil
                         departure_countdown = nil
+                    end
+
+                elseif msg.action == "request_dispatch" and station_config.is_hub then
+                    -- Remote station is sending a train TO hub — set switches OFF for inbound
+                    if msg.to == os.getComputerID() then
+                        -- Unlock any existing lock
+                        switches_locked = false
+                        switches_locked_for = nil
+                        pending_switch_lock = nil
+                        -- Set all parking switches OFF so train can reach hub
+                        for i, sw in ipairs(station_config.switches) do
+                            if sw.parking then
+                                set_switch(i, false)
+                            end
+                        end
+                        print("[hub] Inbound train from " .. (msg.from and ("#" .. msg.from) or "?") .. " - switches open")
                     end
                 end
             end
