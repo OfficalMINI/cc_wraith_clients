@@ -73,10 +73,15 @@ local function load_config()
 end
 
 local function save_config()
-    local f = fs.open(CONFIG_FILE, "w")
+    local ok, content = pcall(textutils.serialise, train_config)
+    if not ok or not content or #content < 5 then return end
+    local tmp = CONFIG_FILE .. ".tmp"
+    local f = fs.open(tmp, "w")
     if f then
-        f.write(textutils.serialise(train_config))
+        f.write(content)
         f.close()
+        if fs.exists(CONFIG_FILE) then fs.delete(CONFIG_FILE) end
+        fs.move(tmp, CONFIG_FILE)
     end
 end
 

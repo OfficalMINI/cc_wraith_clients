@@ -86,10 +86,15 @@ local last_activity = os.clock()
 -- Config Persistence
 -- ========================================
 local function save_cfg()
-    local f = fs.open(CONFIG_FILE, "w")
+    local ok, content = pcall(textutils.serialise, cfg)
+    if not ok or not content or #content < 5 then return end
+    local tmp = CONFIG_FILE .. ".tmp"
+    local f = fs.open(tmp, "w")
     if f then
-        f.write(textutils.serialise(cfg))
+        f.write(content)
         f.close()
+        if fs.exists(CONFIG_FILE) then fs.delete(CONFIG_FILE) end
+        fs.move(tmp, CONFIG_FILE)
     end
 end
 
