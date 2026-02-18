@@ -491,7 +491,7 @@ local switches_locked_for = nil   -- hub: destination station id we're waiting o
 local switches_locked_time = 0    -- os.clock() when locked (for safety timeout)
 local SWITCH_LOCK_TIMEOUT = 120   -- max seconds to hold switches locked
 local pending_switch_lock = nil   -- {station_id, label} lock to engage when train departs hub
-local train_enroute = nil         -- {from_label, to_label} tracks train in transit for display
+local train_enroute = nil         -- {from_id, to_id, from_label, to_label, started} tracks train in transit
 
 -- Per-bay state tracking for parking bays
 -- Keyed by switch index: {last_signal, last_toggle_time, has_train}
@@ -935,17 +935,23 @@ local function compute_map_layout(stations, hub_id, mw, mh)
     return result
 end
 
-local function draw_map_line(mon, x1, y1, x2, y2, color)
-    mon.setTextColor(color)
+local function draw_map_line(mon, x1, y1, x2, y2, color, progress_color, progress)
+    -- progress: 0-1 fraction, fills line from start with progress_color
     local dx = x2 - x1
     local dy = y2 - y1
     local steps = math.max(math.abs(dx), math.abs(dy))
     if steps <= 1 then return end
+    local fill_steps = progress and math.floor(steps * math.min(progress, 1)) or 0
     for i = 1, steps - 1 do
         local t = i / steps
         local x = math.floor(x1 + dx * t + 0.5)
         local y = math.floor(y1 + dy * t + 0.5)
         mon.setCursorPos(x, y)
+        if progress_color and i <= fill_steps then
+            mon.setTextColor(progress_color)
+        else
+            mon.setTextColor(color)
+        end
         if math.abs(dy) < math.abs(dx) * 0.3 then
             mon.write("-")
         elseif math.abs(dx) < math.abs(dy) * 0.3 then
@@ -2377,11 +2383,51 @@ local function render_map()
         if node.st.is_hub then hub_node = node; break end
     end
 
+    -- Compute en-route progress from trip stats
+    local enroute_from, enroute_to, enroute_progress = nil, nil, nil
+    if train_enroute and train_enroute.from_id and train_enroute.to_id then
+        enroute_from = train_enroute.from_id
+        enroute_to = train_enroute.to_id
+        local elapsed = os.clock() - (train_enroute.started or os.clock())
+        -- Look up avg trip duration for the destination station
+        local dest_id = train_enroute.to_id
+        if map_data.trip_stats and map_data.trip_stats[dest_id] and map_data.trip_stats[dest_id].avg_duration_ms then
+            local avg_sec = map_data.trip_stats[dest_id].avg_duration_ms / 1000
+            if avg_sec > 0 then
+                enroute_progress = math.min(elapsed / avg_sec, 0.95)
+            end
+        end
+        -- Fallback: no trip history, show slow pulse (cap at 50%)
+        if not enroute_progress then
+            enroute_progress = math.min(elapsed / 120, 0.5)
+        end
+    end
+
     -- Draw connection lines from hub to each station
     if hub_node then
         for _, node in ipairs(layout) do
             if node.id ~= hub_node.id then
-                draw_map_line(monitor, hub_node.cx, hub_node.cy, node.cx, node.cy, colors.gray)
+                -- Check if this line is the active en-route path
+                local is_enroute = false
+                local prog = nil
+                local lx1, ly1, lx2, ly2 = hub_node.cx, hub_node.cy, node.cx, node.cy
+                if enroute_from and enroute_to then
+                    if enroute_from == hub_node.id and enroute_to == node.id then
+                        -- Outbound from hub to this station
+                        is_enroute = true
+                        prog = enroute_progress
+                    elseif enroute_from == node.id and enroute_to == hub_node.id then
+                        -- Inbound from this station to hub (draw progress from station end)
+                        is_enroute = true
+                        prog = enroute_progress
+                        lx1, ly1, lx2, ly2 = node.cx, node.cy, hub_node.cx, hub_node.cy
+                    end
+                end
+                if is_enroute then
+                    draw_map_line(monitor, lx1, ly1, lx2, ly2, colors.gray, colors.lime, prog)
+                else
+                    draw_map_line(monitor, hub_node.cx, hub_node.cy, node.cx, node.cy, colors.gray)
+                end
             end
         end
     end
@@ -2392,10 +2438,10 @@ local function render_map()
         local marker_color
         if not st.online then
             marker_color = colors.red
-        elseif st.is_hub then
-            marker_color = colors.yellow
         elseif st.has_train then
             marker_color = colors.lime
+        elseif st.is_hub then
+            marker_color = colors.yellow
         else
             marker_color = colors.lightBlue
         end
@@ -2410,7 +2456,7 @@ local function render_map()
         if lx + #short - 1 > mw then lx = node.cx - #short - 1 end
         if lx >= 1 and lx + #short - 1 <= mw then
             monitor.setCursorPos(lx, node.cy)
-            monitor.setTextColor(st.is_hub and colors.yellow or colors.white)
+            monitor.setTextColor(marker_color)
             monitor.write(short)
         end
 
@@ -2421,11 +2467,35 @@ local function render_map()
         })
     end
 
-    -- Bottom: en-route or legend
+    -- Bottom: en-route with ETA or legend
     monitor.setCursorPos(1, mh)
     if train_enroute then
         monitor.setTextColor(colors.orange)
-        monitor.write(string.format(" \16 %s > %s", train_enroute.from_label:sub(1, 12), train_enroute.to_label:sub(1, 12)))
+        local route_str = string.format(" \16 %s > %s", train_enroute.from_label:sub(1, 10), train_enroute.to_label:sub(1, 10))
+        monitor.write(route_str)
+        -- Show ETA based on trip stats
+        local dest_id = train_enroute.to_id
+        local elapsed = os.clock() - (train_enroute.started or os.clock())
+        local eta_str = nil
+        if map_data and map_data.trip_stats and dest_id and map_data.trip_stats[dest_id] and map_data.trip_stats[dest_id].avg_duration_ms then
+            local avg_sec = map_data.trip_stats[dest_id].avg_duration_ms / 1000
+            local remaining = math.max(0, avg_sec - elapsed)
+            if remaining > 60 then
+                eta_str = string.format("ETA %dm%ds", math.floor(remaining / 60), math.floor(remaining % 60))
+            else
+                eta_str = string.format("ETA %ds", math.floor(remaining))
+            end
+        else
+            eta_str = string.format("%ds", math.floor(elapsed))
+        end
+        if eta_str then
+            local ex = mw - #eta_str
+            if ex > #route_str + 1 then
+                monitor.setCursorPos(ex, mh)
+                monitor.setTextColor(colors.lime)
+                monitor.write(eta_str)
+            end
+        end
     else
         monitor.setTextColor(colors.yellow)
         monitor.write("\4")
@@ -2970,7 +3040,7 @@ local function command_listener()
                                 switches_locked = true
                                 switches_locked_for = target_id
                                 switches_locked_time = os.clock()
-                                train_enroute = {from_label = station_config.label, to_label = target_label}
+                                train_enroute = {from_id = os.getComputerID(), to_id = target_id, from_label = station_config.label, to_label = target_label, started = os.clock()}
                                 print("[hub] Direct dispatch bay " .. bay_idx .. " -> " .. target_label)
                                 dispatch_from_bay(bay_idx)
                             end
@@ -3052,7 +3122,7 @@ local function command_listener()
                             end
                         end
                         local from_lbl = msg.from_label or (msg.from and ("#" .. msg.from) or "?")
-                        train_enroute = {from_label = from_lbl, to_label = station_config.label}
+                        train_enroute = {from_id = msg.from, to_id = os.getComputerID(), from_label = from_lbl, to_label = station_config.label, started = os.clock()}
                         print("[hub] Inbound train from " .. from_lbl .. " - switches open")
                     end
                 end
@@ -3173,6 +3243,7 @@ local function train_arrival_handler()
                 label = target.label or ("#" .. target.station_id),
             }
 
+            train_enroute = {from_id = os.getComputerID(), to_id = target.station_id, from_label = station_config.label, to_label = target.label or ("#" .. target.station_id), started = os.clock()}
             os.sleep(1)
             if has_train then
                 dispatch()
@@ -3271,6 +3342,7 @@ local function train_arrival_handler()
                         from_label = station_config.label,
                         to = HUB_ID,
                     }, PROTOCOLS.command)
+                    train_enroute = {from_id = os.getComputerID(), to_id = HUB_ID, from_label = station_config.label, to_label = "Hub", started = os.clock()}
                     os.sleep(1)
                     dispatch()
                 end
@@ -3329,10 +3401,11 @@ local function departure_handler()
                 rednet.send(HUB_ID, {
                     action = "request_dispatch",
                     from = os.getComputerID(),
+                    from_label = station_config.label,
                     to = dest.id,
                 }, PROTOCOLS.command)
             end
-            train_enroute = {from_label = station_config.label, to_label = dest.label}
+            train_enroute = {from_id = os.getComputerID(), to_id = dest.id, from_label = station_config.label, to_label = dest.label, started = os.clock()}
             print("[depart] Dispatching to " .. dest.label)
             dispatch()
         end
