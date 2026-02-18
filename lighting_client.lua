@@ -92,7 +92,7 @@ local function check_for_updates()
         return false
     end
     if not content or #content < 100 then
-        print("[update] Bad response (" .. #content .. "b)")
+        print("[update] Bad response (" .. (content and #content or 0) .. "b)")
         return false
     end
     local sum = 0
@@ -370,7 +370,10 @@ end
 local function update_checker()
     while true do
         sleep(300)
-        check_for_updates()
+        local ok, err = pcall(check_for_updates)
+        if not ok then
+            print("[update] Error: " .. tostring(err))
+        end
     end
 end
 
