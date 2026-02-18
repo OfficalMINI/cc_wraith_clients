@@ -45,6 +45,7 @@ local DISCOVERY_TIMEOUT = 3
 local DISPATCH_PULSE = 1.5       -- seconds to power rail for dispatch
 local DETECTOR_FALLBACK_POLL = 0.1 -- poll interval (~2 game ticks, fastest practical)
 local AUTO_PARK_DELAY = 5        -- seconds after arrival before auto-parking
+local AUTO_RETURN_DELAY = 30     -- seconds before idle remote train returns to hub
 local PLAYER_DETECT_RANGE = 16   -- blocks range for player detector
 local PLAYER_CHECK_INTERVAL = 2  -- seconds between player proximity checks
 
@@ -482,6 +483,7 @@ local switches_locked_for = nil   -- hub: destination station id we're waiting o
 local switches_locked_time = 0    -- os.clock() when locked (for safety timeout)
 local SWITCH_LOCK_TIMEOUT = 120   -- max seconds to hold switches locked
 local pending_switch_lock = nil   -- {station_id, label} lock to engage when train departs hub
+local train_enroute = nil         -- {from_label, to_label} tracks train in transit for display
 
 -- Per-bay state tracking for parking bays
 -- Keyed by switch index: {last_signal, last_toggle_time, has_train}
@@ -646,6 +648,8 @@ local function check_detector()
             last_toggle_time = now
             if has_train then
                 print("[det] >>> TRAIN ARRIVED <<<")
+                -- Clear en-route status
+                train_enroute = nil
                 -- Hub: train arrived — unlock switches (inbound train reached hub safely)
                 if station_config.is_hub and (switches_locked or pending_switch_lock) then
                     switches_locked = false
@@ -780,6 +784,10 @@ local function render_main_monitor()
     if has_train then
         monitor.setTextColor(colors.lime)
         monitor.write("DETECTED")
+    elseif train_enroute then
+        monitor.setTextColor(colors.orange)
+        local route_txt = train_enroute.from_label .. " > " .. train_enroute.to_label
+        monitor.write(route_txt:sub(1, mw - 7))
     else
         monitor.setTextColor(colors.gray)
         monitor.write("NONE")
@@ -1771,10 +1779,14 @@ local function command_listener()
                     print("Station auto-registered: " .. (msg.label or "#" .. sender))
                 end
                 -- Unlock switches if destination station reports train arrived
-                if switches_locked and switches_locked_for == sender and msg.has_train == true then
-                    switches_locked = false
-                    switches_locked_for = nil
-                    print("[hub] Train arrived at #" .. sender .. " - switches unlocked")
+                if switches_locked and msg.has_train == true then
+                    if switches_locked_for == sender then
+                        switches_locked = false
+                        switches_locked_for = nil
+                        pending_switch_lock = nil
+                        train_enroute = nil
+                        print("[hub] Train arrived at #" .. sender .. " - switches unlocked")
+                    end
                 end
                 -- Send heartbeat response so remote knows hub is alive
                 rednet.send(sender, {
@@ -1866,6 +1878,7 @@ local function command_listener()
                             switches_locked = true
                             switches_locked_for = target_id
                             switches_locked_time = os.clock()
+                            train_enroute = {from_label = station_config.label, to_label = target_label}
                             print("[hub] Direct dispatch bay " .. bay_idx .. " -> " .. target_label)
                             dispatch_from_bay(bay_idx)
                         else
@@ -1898,7 +1911,9 @@ local function command_listener()
                                 set_switch(i, false)
                             end
                         end
-                        print("[hub] Inbound train from " .. (msg.from and ("#" .. msg.from) or "?") .. " - switches open")
+                        local from_lbl = msg.from_label or (msg.from and ("#" .. msg.from) or "?")
+                        train_enroute = {from_label = from_lbl, to_label = station_config.label}
+                        print("[hub] Inbound train from " .. from_lbl .. " - switches open")
                     end
                 end
             end
@@ -2036,6 +2051,57 @@ local function train_arrival_handler()
                     auto_park()
                 end
             end
+
+        elseif not station_config.is_hub and HUB_ID then
+            -- Remote: auto-return idle train to hub after delay
+            print("[auto-return] Train arrived, waiting " .. AUTO_RETURN_DELAY .. "s...")
+            local return_timer = os.startTimer(AUTO_RETURN_DELAY)
+            local should_return = true
+            while true do
+                local e, p1 = os.pullEvent()
+                if e == "timer" and p1 == return_timer then
+                    break
+                elseif e == "train_departed" then
+                    print("[auto-return] Cancelled (train left)")
+                    should_return = false
+                    break
+                elseif e == "destination_selected" then
+                    print("[auto-return] Cancelled (destination selected)")
+                    should_return = false
+                    break
+                end
+            end
+            -- Wait for players to leave before returning
+            if should_return and has_train then
+                check_players_nearby()
+                if players_nearby then
+                    print("[auto-return] Players nearby, waiting...")
+                    while true do
+                        if not has_train then
+                            should_return = false
+                            break
+                        end
+                        check_players_nearby()
+                        if not players_nearby then
+                            print("[auto-return] Players left, returning to hub...")
+                            break
+                        end
+                        os.sleep(PLAYER_CHECK_INTERVAL)
+                    end
+                end
+                if should_return and has_train then
+                    print("[auto-return] Sending train back to hub #" .. HUB_ID)
+                    -- Notify hub so it sets switches OFF for inbound
+                    rednet.send(HUB_ID, {
+                        action = "request_dispatch",
+                        from = os.getComputerID(),
+                        from_label = station_config.label,
+                        to = HUB_ID,
+                    }, PROTOCOLS.command)
+                    os.sleep(1)
+                    dispatch()
+                end
+            end
         end
     end
 end
@@ -2093,6 +2159,7 @@ local function departure_handler()
                     to = dest.id,
                 }, PROTOCOLS.command)
             end
+            train_enroute = {from_label = station_config.label, to_label = dest.label}
             print("[depart] Dispatching to " .. dest.label)
             dispatch()
         end
