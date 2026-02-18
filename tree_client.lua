@@ -454,9 +454,21 @@ local function do_comms()
     local modem, side = find_adjacent_modem()
     local stepped = false
 
-    -- Path is wired modems, so modem may be below. Also try stepping forward
-    -- to reach a modem (home position: modem is 1 forward)
-    if not modem then
+    -- At home position, chest is below and modem is 1 block forward.
+    -- Step forward to reach the modem — retry if blocked (sapling, etc.)
+    if not modem and is_container_below() then
+        for attempt = 1, MAX_MOVE_TRIES do
+            -- Clear non-protected blocks in front
+            if not is_protected(turtle.inspect) then turtle.dig() end
+            if turtle.forward() then
+                stepped = true
+                modem, side = find_adjacent_modem()
+                break
+            end
+            sleep(0.3)
+        end
+    elseif not modem then
+        -- Generic fallback: single forward attempt
         if turtle.forward() then
             stepped = true
             modem, side = find_adjacent_modem()
@@ -464,7 +476,12 @@ local function do_comms()
     end
     if not modem then
         print("[do_comms] no modem found")
-        if stepped then turtle.back() end
+        if stepped then
+            for i = 1, MAX_MOVE_TRIES do
+                if turtle.back() then break end
+                sleep(0.3)
+            end
+        end
         return
     end
 

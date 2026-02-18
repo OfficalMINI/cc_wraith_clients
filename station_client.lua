@@ -114,6 +114,8 @@ end
 local connected_stations = {}
 -- Hub ID: known hub computer ID (self if hub, discovered if remote)
 local HUB_ID = nil
+-- Wraith OS transport service ID (discovered via rednet)
+local WRAITH_ID = nil
 
 if station_config.is_hub then
     HUB_ID = os.getComputerID()
@@ -1755,6 +1757,55 @@ local function register_with_hub()
 end
 
 -- ========================================
+-- Wraith OS Discovery & Registration
+-- ========================================
+local function discover_wraith()
+    -- Look for Wraith's transport service via rednet DNS
+    local wraith_id = rednet.lookup(PROTOCOLS.ping, "wraith_rail_hub")
+    if wraith_id and wraith_id ~= os.getComputerID() then
+        -- Don't connect to self, and don't confuse with hub station
+        if wraith_id ~= HUB_ID then
+            WRAITH_ID = wraith_id
+            print("[wraith] Found Wraith OS #" .. wraith_id)
+            return true
+        end
+    end
+    return false
+end
+
+local function register_with_wraith()
+    if not WRAITH_ID then return false end
+    rednet.send(WRAITH_ID, {
+        label = station_config.label,
+        id = os.getComputerID(),
+        x = my_x, y = my_y, z = my_z,
+        is_hub = station_config.is_hub,
+        has_train = has_train,
+        switches = station_config.switches,
+        rail_periph = station_config.rail_periph,
+        rail_face = station_config.rail_face,
+        detector_periph = station_config.detector_periph,
+        detector_face = station_config.detector_face,
+    }, PROTOCOLS.register)
+    local sender, msg = rednet.receive(PROTOCOLS.status, 3)
+    if sender == WRAITH_ID and type(msg) == "table" then
+        print("[wraith] Registered with Wraith OS #" .. WRAITH_ID)
+        return true
+    end
+    return false
+end
+
+local function heartbeat_wraith()
+    if not WRAITH_ID then return end
+    rednet.send(WRAITH_ID, {
+        id = os.getComputerID(),
+        label = station_config.label,
+        has_train = has_train,
+        is_hub = station_config.is_hub,
+    }, PROTOCOLS.heartbeat)
+end
+
+-- ========================================
 -- Hub Station List Helper
 -- ========================================
 local function get_station_list()
@@ -2021,8 +2072,17 @@ local function command_listener()
 end
 
 local function discovery_loop()
+    -- Wraith discovery counter — try every 3rd loop iteration
+    local wraith_tick = 0
+
     if station_config.is_hub then
-        -- Hub: check for offline stations + switch lock timeout
+        -- Hub: check for offline stations + switch lock timeout + Wraith heartbeat
+        -- Discover Wraith on startup
+        if not WRAITH_ID then
+            discover_wraith()
+            if WRAITH_ID then register_with_wraith() end
+        end
+
         while true do
             sleep(10)
             local now = os.clock()
@@ -2038,10 +2098,26 @@ local function discovery_loop()
                 switches_locked = false
                 switches_locked_for = nil
             end
+            -- Heartbeat to Wraith OS
+            wraith_tick = wraith_tick + 1
+            if WRAITH_ID then
+                heartbeat_wraith()
+            elseif wraith_tick % 3 == 0 then
+                -- Periodically retry Wraith discovery
+                discover_wraith()
+                if WRAITH_ID then register_with_wraith() end
+            end
         end
     else
-        -- Remote: discover and maintain connection to hub
+        -- Remote: discover and maintain connection to hub + Wraith
         local missed_pings = 0
+
+        -- Discover Wraith on startup
+        if not WRAITH_ID then
+            discover_wraith()
+            if WRAITH_ID then register_with_wraith() end
+        end
+
         while true do
             if not HUB_ID then
                 if discover_hub() then
@@ -2071,6 +2147,14 @@ local function discovery_loop()
                         route_data = resp.stations
                     end
                 end
+            end
+            -- Heartbeat to Wraith OS
+            wraith_tick = wraith_tick + 1
+            if WRAITH_ID then
+                heartbeat_wraith()
+            elseif wraith_tick % 3 == 0 then
+                discover_wraith()
+                if WRAITH_ID then register_with_wraith() end
             end
         end
     end
