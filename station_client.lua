@@ -1851,14 +1851,12 @@ local function command_listener()
                             end
                         end
                         if bay_idx then
-                            -- Set ALL parking switches to ON (bypass) so train exits
-                            -- bay and goes to hub main track, not back into another bay
+                            -- Target bay switch OFF (open path out), others ON (block)
                             for i, sw in ipairs(station_config.switches) do
                                 if sw.parking then
-                                    set_switch(i, true)
+                                    set_switch(i, i ~= bay_idx)
                                 end
                             end
-                            -- Don't lock yet — lock after train leaves hub (detector confirms departure)
                             print("[hub] Pulling from bay " .. bay_idx .. " for " .. pending_outbound.label)
                             dispatch_from_bay(bay_idx)
                         else
@@ -1951,7 +1949,12 @@ local function train_arrival_handler()
             pending_outbound = nil
             print("[hub] Train ready, sending to " .. (target.label or "#" .. target.station_id))
 
-            -- Switches already set to bypass from bay pull
+            -- Train is now at hub — set ALL switches to bypass (ON) for outbound
+            for i, sw in ipairs(station_config.switches) do
+                if sw.parking then
+                    set_switch(i, true)
+                end
+            end
             -- Prepare lock — will engage when hub detector confirms train departed
             pending_switch_lock = {
                 station_id = target.station_id,
@@ -2151,13 +2154,12 @@ local function monitor_touch_loop()
                                     end
                                 end
                                 if bay_idx then
-                                    -- Set ALL parking switches to ON (bypass) so train exits bay
+                                    -- Target bay switch OFF (open path out), others ON (block)
                                     for i, sw in ipairs(station_config.switches) do
                                         if sw.parking then
-                                            set_switch(i, true)
+                                            set_switch(i, i ~= bay_idx)
                                         end
                                     end
-                                    -- Don't lock yet — lock after train leaves hub
                                     print("[hub] Pulling from bay " .. bay_idx .. " for departure")
                                     dispatch_from_bay(bay_idx)
                                 else
@@ -2566,10 +2568,11 @@ local function terminal_input()
                 end
 
             elseif cmd == "unlock" then
-                if switches_locked then
+                if switches_locked or pending_switch_lock then
                     switches_locked = false
                     switches_locked_for = nil
-                    print("Switches unlocked")
+                    pending_switch_lock = nil
+                    print("Switches unlocked (lock + pending cleared)")
                 else
                     print("Switches not locked")
                 end
