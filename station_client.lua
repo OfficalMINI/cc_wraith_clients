@@ -749,6 +749,59 @@ local function mon_btn(y1, y2, action, data)
     table.insert(monitor_buttons, {y1 = y1, y2 = y2 or y1, action = action, data = data})
 end
 
+-- ========================================
+-- Schedule UI State
+-- ========================================
+local cached_allow_list = {}    -- from Wraith: {{item, display_name, min_keep}, ...}
+local cached_schedules = {}     -- from Wraith: schedule array for this station
+local sched_scroll = 0
+local sched_item_scroll = 0
+local new_schedule = nil        -- temp table during creation flow
+local sched_detail_idx = nil    -- which schedule is being viewed
+local sched_status_msg = nil
+local sched_status_time = 0
+
+local PERIOD_PRESETS = {
+    {label = "Manual",  seconds = 0},
+    {label = "5 min",   seconds = 300},
+    {label = "15 min",  seconds = 900},
+    {label = "30 min",  seconds = 1800},
+    {label = "Hourly",  seconds = 3600},
+    {label = "4 Hours", seconds = 14400},
+    {label = "Daily",   seconds = 86400},
+}
+
+local function format_period(seconds)
+    if not seconds or seconds <= 0 then return "Manual" end
+    if seconds < 60 then return seconds .. "s" end
+    if seconds < 3600 then return math.floor(seconds / 60) .. "m" end
+    if seconds < 86400 then return math.floor(seconds / 3600) .. "h" end
+    return math.floor(seconds / 86400) .. "d"
+end
+
+local function sched_send(msg)
+    if not WRAITH_ID then return end
+    msg.station_id = os.getComputerID()
+    rednet.send(WRAITH_ID, msg, PROTOCOLS.command)
+end
+
+local function sched_fetch_data()
+    if not WRAITH_ID then return end
+    sched_send({action = "get_allow_list"})
+    sched_send({action = "get_schedules"})
+end
+
+local function set_sched_status(text)
+    sched_status_msg = text
+    sched_status_time = os.clock()
+end
+
+local function clean_item_name(name)
+    if not name then return "?" end
+    local short = name:gsub("^%w+:", "")
+    return short:gsub("_", " "):gsub("(%a)([%w]*)", function(a, b) return a:upper() .. b end)
+end
+
 local function render_main_monitor()
     if not monitor then return end
 
@@ -756,18 +809,27 @@ local function render_main_monitor()
     monitor.setBackgroundColor(colors.black)
     monitor.clear()
 
-    -- Title + SETUP button
+    -- Title + SCHED + SETUP buttons
     monitor.setCursorPos(1, 1)
     monitor.setTextColor(colors.cyan)
     local title = station_config.label
     if station_config.is_hub then title = "[HUB] " .. title end
-    monitor.write(title:sub(1, mw - 8))
     local setup_lbl = "[SETUP]"
+    local sched_lbl = "[SCHED]"
+    monitor.write(title:sub(1, mw - #setup_lbl - #sched_lbl - 1))
+
+    local sched_x = mw - #setup_lbl - #sched_lbl
+    monitor.setCursorPos(sched_x, 1)
+    monitor.setBackgroundColor(colors.purple)
+    monitor.setTextColor(colors.white)
+    monitor.write(sched_lbl)
+
     monitor.setCursorPos(mw - #setup_lbl + 1, 1)
     monitor.setBackgroundColor(colors.gray)
     monitor.setTextColor(colors.white)
     monitor.write(setup_lbl)
     monitor.setBackgroundColor(colors.black)
+    mon_btn(1, 1, "open_schedules", {x1 = sched_x, x2 = sched_x + #sched_lbl - 1})
     mon_btn(1, 1, "open_config", {x1 = mw - #setup_lbl + 1, x2 = mw})
 
     -- Status line
@@ -1639,6 +1701,408 @@ local function render_buffer_chest_picker()
     end
 end
 
+-- ========================================
+-- Schedule Monitor Screens
+-- ========================================
+
+local function render_sched_header(title, mw, show_action, action_label, action_name)
+    monitor.setCursorPos(1, 1)
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(colors.white)
+    monitor.clearLine()
+    monitor.write(" < BACK")
+    mon_btn(1, 1, "sched_back", {x1 = 1, x2 = 7})
+    if show_action and action_label then
+        local ax = mw - #action_label
+        monitor.setCursorPos(ax, 1)
+        monitor.setBackgroundColor(colors.lime)
+        monitor.setTextColor(colors.black)
+        monitor.write(action_label)
+        mon_btn(1, 1, action_name, {x1 = ax, x2 = mw})
+    end
+    monitor.setBackgroundColor(colors.black)
+    monitor.setCursorPos(1, 2)
+    monitor.setTextColor(colors.cyan)
+    monitor.write(" " .. title)
+end
+
+local function render_schedules()
+    if not monitor then return end
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    render_sched_header("SCHEDULES (" .. #cached_schedules .. ")", mw, true, " + NEW ", "sched_new")
+
+    -- Status message (fades after 5s)
+    local status_y = 3
+    if sched_status_msg and (os.clock() - sched_status_time) < 5 then
+        monitor.setCursorPos(1, status_y)
+        monitor.setTextColor(colors.yellow)
+        monitor.write(" " .. sched_status_msg:sub(1, mw - 2))
+        status_y = 4
+    end
+
+    if not WRAITH_ID then
+        monitor.setCursorPos(1, status_y + 1)
+        monitor.setTextColor(colors.orange)
+        monitor.write(" Not connected to Wraith")
+        return
+    end
+
+    if #cached_schedules == 0 then
+        monitor.setCursorPos(1, status_y + 1)
+        monitor.setTextColor(colors.lightGray)
+        monitor.write(" No schedules yet")
+        monitor.setCursorPos(1, status_y + 2)
+        monitor.write(" Tap [+ NEW] to create one")
+        return
+    end
+
+    local row_start = status_y
+    local max_rows = mh - row_start - 1
+    for i = 1 + sched_scroll, math.min(#cached_schedules, sched_scroll + max_rows) do
+        local s = cached_schedules[i]
+        local y = row_start + (i - sched_scroll - 1)
+        if y > mh - 1 then break end
+
+        local icon = (s.type == "delivery") and ">" or "<"
+        local typ = (s.type == "delivery") and "DELIV" or "COLCT"
+        local per = format_period(s.period)
+        local items_txt = ""
+        if s.type == "delivery" and s.items then
+            items_txt = #s.items .. " item" .. (#s.items ~= 1 and "s" or "")
+        end
+        local status = s.enabled and "ON" or "OFF"
+        local status_col = s.enabled and colors.lime or colors.red
+
+        monitor.setCursorPos(1, y)
+        monitor.setTextColor(colors.white)
+        monitor.write(string.format(" %s %-5s %-6s %-8s", icon, typ, per, items_txt))
+        monitor.setTextColor(status_col)
+        local sx = mw - 6
+        monitor.setCursorPos(sx, y)
+        monitor.write(string.format("%-3s", status))
+        monitor.setTextColor(colors.lightBlue)
+        monitor.setCursorPos(mw - 2, y)
+        monitor.write("[>]")
+        mon_btn(y, y, "sched_view", {idx = i})
+    end
+
+    -- Scroll buttons
+    if sched_scroll > 0 then
+        monitor.setCursorPos(mw - 3, row_start)
+        monitor.setTextColor(colors.yellow)
+        monitor.write("[^]")
+        mon_btn(row_start, row_start, "sched_scroll_up", {x1 = mw - 3, x2 = mw})
+    end
+    if sched_scroll + max_rows < #cached_schedules then
+        monitor.setCursorPos(mw - 3, mh)
+        monitor.setTextColor(colors.yellow)
+        monitor.write("[v]")
+        mon_btn(mh, mh, "sched_scroll_down", {x1 = mw - 3, x2 = mw})
+    end
+end
+
+local function render_sched_new_type()
+    if not monitor then return end
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    render_sched_header("NEW SCHEDULE", mw, false)
+
+    monitor.setCursorPos(1, 4)
+    monitor.setTextColor(colors.lightGray)
+    monitor.write(" Select type:")
+
+    -- Delivery button
+    local y = 6
+    monitor.setCursorPos(2, y)
+    monitor.setBackgroundColor(colors.blue)
+    monitor.setTextColor(colors.white)
+    local dlbl = " DELIVERY  "
+    monitor.write(dlbl)
+    monitor.setBackgroundColor(colors.black)
+    monitor.setCursorPos(2 + #dlbl + 1, y)
+    monitor.setTextColor(colors.lightGray)
+    monitor.write("Send items here")
+    mon_btn(y, y, "sched_type_delivery", {x1 = 2, x2 = 2 + #dlbl - 1})
+
+    -- Collection button
+    y = 8
+    monitor.setCursorPos(2, y)
+    monitor.setBackgroundColor(colors.blue)
+    monitor.setTextColor(colors.white)
+    local clbl = " COLLECTION "
+    monitor.write(clbl)
+    monitor.setBackgroundColor(colors.black)
+    monitor.setCursorPos(2 + #clbl + 1, y)
+    monitor.setTextColor(colors.lightGray)
+    monitor.write("Pick up items")
+    mon_btn(y, y, "sched_type_collection", {x1 = 2, x2 = 2 + #clbl - 1})
+end
+
+local function render_sched_pick_items()
+    if not monitor then return end
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    local chosen = new_schedule and new_schedule.items or {}
+    local count = #chosen
+    render_sched_header("SELECT ITEMS (" .. count .. ")", mw, count > 0, " DONE > ", "sched_items_done")
+
+    if #cached_allow_list == 0 then
+        monitor.setCursorPos(1, 4)
+        monitor.setTextColor(colors.orange)
+        monitor.write(" No items in allow list")
+        monitor.setCursorPos(1, 5)
+        monitor.setTextColor(colors.lightGray)
+        monitor.write(" Add items in Wraith transport app")
+        return
+    end
+
+    local row_start = 3
+    local max_rows = mh - row_start
+    for i = 1 + sched_item_scroll, math.min(#cached_allow_list, sched_item_scroll + max_rows) do
+        local item = cached_allow_list[i]
+        local y = row_start + (i - sched_item_scroll - 1)
+        if y > mh then break end
+
+        local selected = false
+        for _, name in ipairs(chosen) do
+            if name == item.item then selected = true; break end
+        end
+
+        monitor.setCursorPos(1, y)
+        if selected then
+            monitor.setTextColor(colors.lime)
+            monitor.write(" [x] ")
+        else
+            monitor.setTextColor(colors.lightGray)
+            monitor.write(" [ ] ")
+        end
+        monitor.setTextColor(colors.white)
+        local display = item.display_name or clean_item_name(item.item)
+        monitor.write(display:sub(1, mw - 6))
+        mon_btn(y, y, "sched_toggle_item", {item = item.item})
+    end
+
+    -- Scroll
+    if sched_item_scroll > 0 then
+        monitor.setCursorPos(mw - 3, row_start)
+        monitor.setTextColor(colors.yellow)
+        monitor.write("[^]")
+        mon_btn(row_start, row_start, "sched_item_scroll_up", {x1 = mw - 3, x2 = mw})
+    end
+    if sched_item_scroll + max_rows < #cached_allow_list then
+        monitor.setCursorPos(mw - 3, mh)
+        monitor.setTextColor(colors.yellow)
+        monitor.write("[v]")
+        mon_btn(mh, mh, "sched_item_scroll_down", {x1 = mw - 3, x2 = mw})
+    end
+end
+
+local function render_sched_set_amounts()
+    if not monitor then return end
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    render_sched_header("SET AMOUNTS", mw, true, " DONE > ", "sched_amounts_done")
+
+    local items = new_schedule and new_schedule.items or {}
+    local amounts = new_schedule and new_schedule.amounts or {}
+
+    for i, item_name in ipairs(items) do
+        local y = 2 + i
+        if y > mh then break end
+        local amt = amounts[item_name] or 64
+        local display = nil
+        for _, al in ipairs(cached_allow_list) do
+            if al.item == item_name then display = al.display_name; break end
+        end
+        display = display or clean_item_name(item_name)
+
+        monitor.setCursorPos(1, y)
+        monitor.setTextColor(colors.white)
+        monitor.write(" " .. display:sub(1, mw - 16))
+
+        local btn_x = mw - 12
+        monitor.setCursorPos(btn_x, y)
+        monitor.setBackgroundColor(colors.red)
+        monitor.setTextColor(colors.white)
+        monitor.write("[-]")
+        mon_btn(y, y, "sched_amount_dec", {item = item_name, x1 = btn_x, x2 = btn_x + 2})
+
+        monitor.setBackgroundColor(colors.black)
+        monitor.setTextColor(colors.yellow)
+        monitor.setCursorPos(btn_x + 4, y)
+        monitor.write(string.format("%3d", amt))
+
+        local px = btn_x + 8
+        monitor.setCursorPos(px, y)
+        monitor.setBackgroundColor(colors.lime)
+        monitor.setTextColor(colors.black)
+        monitor.write("[+]")
+        mon_btn(y, y, "sched_amount_inc", {item = item_name, x1 = px, x2 = px + 2})
+        monitor.setBackgroundColor(colors.black)
+    end
+end
+
+local function render_sched_pick_period()
+    if not monitor then return end
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    render_sched_header("SELECT PERIOD", mw, false)
+
+    for i, preset in ipairs(PERIOD_PRESETS) do
+        local y = 2 + i
+        if y > mh then break end
+        monitor.setCursorPos(2, y)
+        monitor.setBackgroundColor(colors.blue)
+        monitor.setTextColor(colors.white)
+        local lbl = " " .. preset.label .. " "
+        monitor.write(lbl)
+        monitor.setBackgroundColor(colors.black)
+        mon_btn(y, y, "sched_select_period", {seconds = preset.seconds, x1 = 2, x2 = 2 + #lbl - 1})
+    end
+end
+
+local function render_sched_detail()
+    if not monitor then return end
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    local sched = cached_schedules[sched_detail_idx]
+    if not sched then
+        render_sched_header("SCHEDULE NOT FOUND", mw, false)
+        return
+    end
+
+    local typ_str = (sched.type == "delivery") and "DELIVERY" or "COLLECTION"
+    render_sched_header("SCHEDULE #" .. sched_detail_idx .. " - " .. typ_str, mw, false)
+
+    local y = 3
+
+    -- Period
+    monitor.setCursorPos(1, y)
+    monitor.setTextColor(colors.lightGray)
+    monitor.write(" Period: ")
+    monitor.setTextColor(colors.white)
+    monitor.write(format_period(sched.period))
+    local chg_x = mw - 7
+    monitor.setCursorPos(chg_x, y)
+    monitor.setBackgroundColor(colors.blue)
+    monitor.setTextColor(colors.white)
+    monitor.write("[CHANGE]")
+    mon_btn(y, y, "sched_change_period_start", {x1 = chg_x, x2 = mw})
+    monitor.setBackgroundColor(colors.black)
+    y = y + 1
+
+    -- Items (delivery only)
+    if sched.type == "delivery" and sched.items then
+        monitor.setCursorPos(1, y)
+        monitor.setTextColor(colors.lightGray)
+        monitor.write(" Items: ")
+        monitor.setTextColor(colors.white)
+        local item_strs = {}
+        for _, item_name in ipairs(sched.items) do
+            local display = nil
+            for _, al in ipairs(cached_allow_list) do
+                if al.item == item_name then display = al.display_name; break end
+            end
+            display = display or clean_item_name(item_name)
+            local amt = (sched.amounts and sched.amounts[item_name]) or 64
+            table.insert(item_strs, display .. "(" .. amt .. ")")
+        end
+        local items_line = table.concat(item_strs, ", ")
+        monitor.write(items_line:sub(1, mw - 9))
+        y = y + 1
+    end
+
+    -- Status
+    monitor.setCursorPos(1, y)
+    monitor.setTextColor(colors.lightGray)
+    monitor.write(" Status: ")
+    if sched.enabled then
+        monitor.setTextColor(colors.lime)
+        monitor.write("ON")
+    else
+        monitor.setTextColor(colors.red)
+        monitor.write("OFF")
+    end
+    local tog_x = mw - 7
+    monitor.setCursorPos(tog_x, y)
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(colors.white)
+    monitor.write("[TOGGLE]")
+    mon_btn(y, y, "sched_toggle_detail", {x1 = tog_x, x2 = mw})
+    monitor.setBackgroundColor(colors.black)
+    y = y + 1
+
+    -- Last run
+    if sched.last_run and sched.last_run > 0 then
+        monitor.setCursorPos(1, y)
+        monitor.setTextColor(colors.lightGray)
+        local now = math.floor(os.epoch("utc") / 1000)
+        local ago = now - sched.last_run
+        monitor.write(" Last run: " .. format_period(ago) .. " ago")
+    end
+    y = y + 2
+
+    -- Action buttons
+    if y <= mh then
+        monitor.setCursorPos(2, y)
+        monitor.setBackgroundColor(colors.lime)
+        monitor.setTextColor(colors.black)
+        monitor.write(" RUN NOW ")
+        mon_btn(y, y, "sched_run_now", {idx = sched_detail_idx, x1 = 2, x2 = 10})
+
+        local del_x = mw - 9
+        monitor.setCursorPos(del_x, y)
+        monitor.setBackgroundColor(colors.red)
+        monitor.setTextColor(colors.white)
+        monitor.write(" DELETE ")
+        mon_btn(y, y, "sched_delete_start", {x1 = del_x, x2 = mw - 1})
+        monitor.setBackgroundColor(colors.black)
+    end
+end
+
+local function render_sched_confirm_delete()
+    if not monitor then return end
+    local mw, mh = monitor.getSize()
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    monitor.setCursorPos(1, 2)
+    monitor.setTextColor(colors.red)
+    monitor.write(" DELETE SCHEDULE #" .. (sched_detail_idx or "?") .. "?")
+
+    monitor.setCursorPos(1, 4)
+    monitor.setTextColor(colors.lightGray)
+    monitor.write(" This cannot be undone.")
+
+    local y = 6
+    monitor.setCursorPos(2, y)
+    monitor.setBackgroundColor(colors.red)
+    monitor.setTextColor(colors.white)
+    monitor.write(" YES, DELETE ")
+    mon_btn(y, y, "sched_delete_confirm", {x1 = 2, x2 = 14})
+
+    local cx = mw - 10
+    monitor.setCursorPos(cx, y)
+    monitor.setBackgroundColor(colors.gray)
+    monitor.setTextColor(colors.white)
+    monitor.write(" CANCEL ")
+    mon_btn(y, y, "sched_delete_cancel", {x1 = cx, x2 = cx + 7})
+    monitor.setBackgroundColor(colors.black)
+end
+
 local function render_monitor()
     if not monitor then return end
     monitor_buttons = {}
@@ -1657,6 +2121,20 @@ local function render_monitor()
         render_player_detector_picker()
     elseif monitor_mode == "pick_buffer_chest" then
         render_buffer_chest_picker()
+    elseif monitor_mode == "schedules" then
+        render_schedules()
+    elseif monitor_mode == "sched_new_type" then
+        render_sched_new_type()
+    elseif monitor_mode == "sched_pick_items" then
+        render_sched_pick_items()
+    elseif monitor_mode == "sched_set_amounts" then
+        render_sched_set_amounts()
+    elseif monitor_mode == "sched_pick_period" then
+        render_sched_pick_period()
+    elseif monitor_mode == "sched_detail" then
+        render_sched_detail()
+    elseif monitor_mode == "sched_confirm_delete" then
+        render_sched_confirm_delete()
     else
         render_main_monitor()
     end
@@ -2047,6 +2525,37 @@ local function command_listener()
                         pending_destination = nil
                         departure_countdown = nil
                     end
+
+                -- Schedule data responses from Wraith
+                elseif msg.action == "allow_list" then
+                    if msg.items then
+                        cached_allow_list = msg.items
+                        print("[sched] Allow list: " .. #cached_allow_list .. " items")
+                        render_monitor()
+                    end
+
+                elseif msg.action == "schedules" then
+                    if msg.schedules then
+                        cached_schedules = msg.schedules
+                        print("[sched] Schedules: " .. #cached_schedules)
+                        render_monitor()
+                    end
+
+                elseif msg.action == "schedule_ok" then
+                    set_sched_status(msg.message or "OK")
+                    render_monitor()
+
+                elseif msg.action == "schedule_error" then
+                    set_sched_status("ERR: " .. (msg.message or "?"))
+                    render_monitor()
+
+                elseif msg.action == "schedule_run_ok" then
+                    set_sched_status(msg.message or "Trip started")
+                    render_monitor()
+
+                elseif msg.action == "schedule_run_error" then
+                    set_sched_status("ERR: " .. (msg.message or "?"))
+                    render_monitor()
 
                 elseif msg.action == "request_dispatch" and station_config.is_hub then
                     -- Remote station is sending a train TO hub — set switches OFF for inbound
@@ -2701,6 +3210,187 @@ local function monitor_touch_loop()
                     scan_integrators()
                     scan_player_detectors()
                     print("Rescanned: " .. #redstone_integrators .. " integrators, " .. #player_detectors .. " player detectors")
+                    render_monitor()
+
+                -- ==============================
+                -- Schedule management actions
+                -- ==============================
+                elseif btn.action == "open_schedules" then
+                    sched_scroll = 0
+                    sched_fetch_data()
+                    monitor_mode = "schedules"
+                    render_monitor()
+
+                elseif btn.action == "sched_back" then
+                    if monitor_mode == "sched_new_type" then
+                        new_schedule = nil
+                        monitor_mode = "schedules"
+                    elseif monitor_mode == "sched_pick_items" then
+                        monitor_mode = "sched_new_type"
+                    elseif monitor_mode == "sched_set_amounts" then
+                        monitor_mode = "sched_pick_items"
+                    elseif monitor_mode == "sched_pick_period" then
+                        if new_schedule and new_schedule.type == "collection" then
+                            monitor_mode = "sched_new_type"
+                        elseif new_schedule then
+                            monitor_mode = "sched_set_amounts"
+                        else
+                            -- Changing period on existing schedule — go back to detail
+                            monitor_mode = "sched_detail"
+                        end
+                    elseif monitor_mode == "sched_detail" then
+                        monitor_mode = "schedules"
+                    elseif monitor_mode == "sched_confirm_delete" then
+                        monitor_mode = "sched_detail"
+                    else
+                        monitor_mode = "main"
+                    end
+                    render_monitor()
+
+                elseif btn.action == "sched_new" then
+                    new_schedule = {type = nil, items = {}, amounts = {}, period = 3600}
+                    sched_item_scroll = 0
+                    monitor_mode = "sched_new_type"
+                    render_monitor()
+
+                elseif btn.action == "sched_type_delivery" then
+                    new_schedule.type = "delivery"
+                    sched_item_scroll = 0
+                    monitor_mode = "sched_pick_items"
+                    render_monitor()
+
+                elseif btn.action == "sched_type_collection" then
+                    new_schedule.type = "collection"
+                    monitor_mode = "sched_pick_period"
+                    render_monitor()
+
+                elseif btn.action == "sched_toggle_item" then
+                    if new_schedule and btn.data and btn.data.item then
+                        local item_name = btn.data.item
+                        local found = false
+                        for j, name in ipairs(new_schedule.items) do
+                            if name == item_name then
+                                table.remove(new_schedule.items, j)
+                                new_schedule.amounts[item_name] = nil
+                                found = true
+                                break
+                            end
+                        end
+                        if not found then
+                            table.insert(new_schedule.items, item_name)
+                            new_schedule.amounts[item_name] = 64
+                        end
+                        render_monitor()
+                    end
+
+                elseif btn.action == "sched_items_done" then
+                    if new_schedule and #new_schedule.items > 0 then
+                        monitor_mode = "sched_set_amounts"
+                    end
+                    render_monitor()
+
+                elseif btn.action == "sched_amount_dec" then
+                    if new_schedule and btn.data and btn.data.item then
+                        local amt = new_schedule.amounts[btn.data.item] or 64
+                        amt = math.max(1, amt - 16)
+                        new_schedule.amounts[btn.data.item] = amt
+                        render_monitor()
+                    end
+
+                elseif btn.action == "sched_amount_inc" then
+                    if new_schedule and btn.data and btn.data.item then
+                        local amt = new_schedule.amounts[btn.data.item] or 64
+                        amt = math.min(256, amt + 16)
+                        new_schedule.amounts[btn.data.item] = amt
+                        render_monitor()
+                    end
+
+                elseif btn.action == "sched_amounts_done" then
+                    monitor_mode = "sched_pick_period"
+                    render_monitor()
+
+                elseif btn.action == "sched_select_period" then
+                    if new_schedule then
+                        -- Creating new schedule
+                        new_schedule.period = btn.data.seconds
+                        sched_send({
+                            action = "add_schedule",
+                            schedule = {
+                                type = new_schedule.type,
+                                items = new_schedule.items,
+                                amounts = new_schedule.amounts,
+                                period = new_schedule.period,
+                            },
+                        })
+                        set_sched_status("Saving...")
+                        new_schedule = nil
+                        monitor_mode = "schedules"
+                    else
+                        -- Updating period on existing schedule
+                        sched_send({action = "update_schedule", idx = sched_detail_idx, field = "period", value = btn.data.seconds})
+                        set_sched_status("Saving...")
+                        monitor_mode = "sched_detail"
+                    end
+                    render_monitor()
+
+                elseif btn.action == "sched_view" then
+                    if btn.data and btn.data.idx then
+                        sched_detail_idx = btn.data.idx
+                        monitor_mode = "sched_detail"
+                        render_monitor()
+                    end
+
+                elseif btn.action == "sched_toggle_detail" then
+                    if sched_detail_idx then
+                        sched_send({action = "toggle_schedule", idx = sched_detail_idx})
+                        set_sched_status("Toggling...")
+                        render_monitor()
+                    end
+
+                elseif btn.action == "sched_run_now" then
+                    if btn.data and btn.data.idx then
+                        sched_send({action = "run_schedule", idx = btn.data.idx})
+                        set_sched_status("Running...")
+                        render_monitor()
+                    end
+
+                elseif btn.action == "sched_change_period_start" then
+                    -- Reuse period picker for editing (new_schedule is nil = edit mode)
+                    new_schedule = nil
+                    monitor_mode = "sched_pick_period"
+                    render_monitor()
+
+                elseif btn.action == "sched_delete_start" then
+                    monitor_mode = "sched_confirm_delete"
+                    render_monitor()
+
+                elseif btn.action == "sched_delete_confirm" then
+                    if sched_detail_idx then
+                        sched_send({action = "remove_schedule", idx = sched_detail_idx})
+                        set_sched_status("Deleting...")
+                    end
+                    sched_detail_idx = nil
+                    monitor_mode = "schedules"
+                    render_monitor()
+
+                elseif btn.action == "sched_delete_cancel" then
+                    monitor_mode = "sched_detail"
+                    render_monitor()
+
+                elseif btn.action == "sched_scroll_up" then
+                    sched_scroll = math.max(0, sched_scroll - 1)
+                    render_monitor()
+
+                elseif btn.action == "sched_scroll_down" then
+                    sched_scroll = sched_scroll + 1
+                    render_monitor()
+
+                elseif btn.action == "sched_item_scroll_up" then
+                    sched_item_scroll = math.max(0, sched_item_scroll - 1)
+                    render_monitor()
+
+                elseif btn.action == "sched_item_scroll_down" then
+                    sched_item_scroll = sched_item_scroll + 1
                     render_monitor()
                 end
 
