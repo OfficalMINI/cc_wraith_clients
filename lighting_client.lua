@@ -75,22 +75,27 @@ local function check_for_updates()
         return false
     end
     print("[update] Checking github...")
-    local ok, resp, err = pcall(http.get, UPDATE_URL)
-    if not ok then
-        print("[update] Error: " .. tostring(resp))
-        return false
+    -- Use async http.request so we don't steal events from parallel coroutines
+    http.request(UPDATE_URL)
+    local timeout = os.startTimer(10)
+    local resp
+    while true do
+        local ev, p1, p2 = os.pullEvent()
+        if ev == "http_success" and p1 == UPDATE_URL then
+            resp = p2
+            os.cancelTimer(timeout)
+            break
+        elseif ev == "http_failure" and p1 == UPDATE_URL then
+            os.cancelTimer(timeout)
+            print("[update] Failed: " .. tostring(p2))
+            return false
+        elseif ev == "timer" and p1 == timeout then
+            print("[update] Timed out")
+            return false
+        end
     end
-    if not resp then
-        print("[update] Failed: " .. tostring(err))
-        return false
-    end
-    local code = resp.getResponseCode()
     local content = resp.readAll()
     resp.close()
-    if code ~= 200 then
-        print("[update] HTTP " .. tostring(code))
-        return false
-    end
     if not content or #content < 100 then
         print("[update] Bad response (" .. (content and #content or 0) .. "b)")
         return false
