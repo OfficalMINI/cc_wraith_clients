@@ -914,11 +914,11 @@ local function path_step(i)
 end
 
 -- ========================================
--- Empty Turtle via Placed Chest Above
+-- Empty Turtle into Depot Chest Below
 -- ========================================
--- Places the turtle's own chest above, drops items into it,
--- waits for the storage system to extract, then breaks the chest.
--- Never uses the depot chest below (items get instantly sucked away).
+-- Drops harvested items into the depot chest directly below
+-- the turtle's home position. Keeps sapling slot 1, 1 wood in
+-- slot 2, and the chest in slot 16 untouched.
 local function empty_turtle()
     -- Check if there's anything to deposit (slots 3-15, excess wood in 2)
     local has_items = false
@@ -928,49 +928,24 @@ local function empty_turtle()
     if turtle.getItemCount(SLOT_WOOD) > 1 then has_items = true end
     if not has_items then return end  -- nothing to deposit
 
-    print("  Emptying inventory")
-
-    if turtle.getItemCount(SLOT_CHEST) < 1 then
-        print("  WARNING: No chest in slot " .. SLOT_CHEST .. " — can't empty!")
+    if not is_container_below() then
+        print("  WARNING: No depot chest below — can't empty!")
         return
     end
 
-    -- Place our chest above
-    ss(SLOT_CHEST)
-    local placed = false
-    for attempt = 1, 5 do
-        if not is_protected(turtle.inspectUp) then turtle.digUp() end
-        if turtle.placeUp() then placed = true; break end
-        sleep(0.5)
-    end
-    if not placed then
-        print("  WARNING: Can't place chest above — skipping empty!")
-        ss(1)
-        return
-    end
+    print("  Emptying inventory into depot")
 
     -- Drop excess wood (keep 1 for comparison)
     ss(SLOT_WOOD)
     if turtle.getItemCount(SLOT_WOOD) > 1 then
-        Du(turtle.getItemCount(SLOT_WOOD) - 1)
+        Dd(turtle.getItemCount(SLOT_WOOD) - 1)
     end
     -- Drop everything from slots 3-15
     for i = 3, 15 do
-        ss(i)
-        Du()
-    end
-
-    -- Wait for storage system to extract items from the chest
-    sleep(2)
-
-    -- Break the chest to reclaim it
-    ss(SLOT_CHEST)
-    turtle.digUp()
-
-    -- Verify we got the chest back
-    if turtle.getItemCount(SLOT_CHEST) < 1 then
-        print("  WARNING: Chest lost! Trying suckUp...")
-        turtle.suckUp()
+        if turtle.getItemCount(i) > 0 then
+            ss(i)
+            Dd()
+        end
     end
     ss(1)
 end
